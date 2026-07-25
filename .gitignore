@@ -1,0 +1,52 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Runtime data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated evaluation and test output
+eval/report-*.md
+eval/recall-report-*.md
+eval/category-recall-report-*.md
+test-results/
+playwright-report/
+screenshots/
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.dump
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Personal development notes
+devDocs/
