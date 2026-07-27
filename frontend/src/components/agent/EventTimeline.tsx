@@ -1,4 +1,4 @@
-import type { TradeEvent } from "../types";
+import type { TradeEvent } from "@/types";
 
 const LABELS: Record<string, string> = {
   "agent.dispatch": "派发子代理",
@@ -47,19 +47,20 @@ function summarize(event: TradeEvent): string {
   }
 }
 
+/** F1 迁移保留，F6 重写为步骤化时间线。 */
 export default function EventTimeline({ events }: { events: TradeEvent[] }) {
   return (
-    <aside className="timeline">
+    <aside>
       <h2>事件时间线</h2>
-      {events.length === 0 && <p className="empty">发送一条购物意图后，这里会实时显示 Agent 在做什么。</p>}
+      {events.length === 0 && <p>发送一条购物意图后，这里会实时显示 Agent 在做什么。</p>}
       <ol>
         {events.map((event, index) => (
-          <li key={index} className={`ev ${event.type.replace(".", "-")}`}>
-            <div className="ev-head">
-              <span className="tag">{LABELS[event.type] ?? event.type}</span>
+          <li key={index}>
+            <div className="flex items-center gap-2">
+              <span>{LABELS[event.type] ?? event.type}</span>
               <time>{event.occurred_at.slice(11, 19)}</time>
             </div>
-            <div className="ev-body">{summarize(event)}</div>
+            <div>{summarize(event)}</div>
           </li>
         ))}
       </ol>

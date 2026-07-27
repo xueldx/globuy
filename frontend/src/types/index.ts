@@ -1,4 +1,4 @@
-/// <reference types="vite/client" />
+// ===== AGUI 事件协议（后端透传，F6 过程可视化 / F7 商品卡片消费）=====
 
 export type TradeEventType =
   | "agent.dispatch"
@@ -41,4 +41,24 @@ export interface ProductCard {
   skus: { sku_id: string; spec: string; price_major: number; currency: string; stock: number }[];
   score: number;
   landed_price?: LandedPrice;
+}
+
+// ===== 会话与消息（F1 引入，F3 填充完整状态机）=====
+
+export type ChatMessageStatus = "streaming" | "done" | "cancelled" | "error";
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  status: ChatMessageStatus;
+  createdAt: string;
+  /** Agent 思考过程（F6 渲染） */
+  thinking?: string;
+}
+
+export interface SessionSummary {
+  id: string;
+  title: string;
+  lastTime: string;
 }
