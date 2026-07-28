@@ -8,6 +8,9 @@ export type TradeEventType =
   | "plan.update"
   | "context.compressed"
   | "model.fallback"
+  | "cache.hit"
+  | "task.queued"
+  | "task.started"
   | "final.result"
   | "error";
 
