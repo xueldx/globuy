@@ -60,8 +60,18 @@ export interface ChatMessage {
   thinking?: string;
 }
 
+/** 会话列表条目（服务端 GET /commerce/sessions 直出，服务端是真相源）。
+ *  title 首轮结束前可能为空串；时间字段为 ISO 字符串，空时是 ""。 */
 export interface SessionSummary {
   id: string;
   title: string;
-  lastTime: string;
+  created_at: string;
+  last_active_at: string;
+}
+
+/** 会话历史里的一轮消息（GET /commerce/sessions/{id}/turns，轮末才定型落库）。 */
+export interface SessionTurn {
+  role: "buyer" | "agent";
+  content: string;
+  created_at: string;
 }

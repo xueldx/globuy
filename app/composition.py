@@ -25,6 +25,7 @@ from app.application.harness.assertions import SequencingTracker
 from app.application.harness.drift_detector import DriftDetector
 from app.application.harness.loop_detector import LoopDetector
 from app.application.memory.preference_selector import PreferenceSelector
+from app.application.session.auto_title import AutoTitler
 from app.application.usecases.catalog_search import CatalogSearchUseCase
 from app.application.usecases.order_usecases import (
     CancelOrderUseCase,
@@ -32,11 +33,13 @@ from app.application.usecases.order_usecases import (
     QueryOrderUseCase,
 )
 from app.domain.queue.ports.task_queue import TaskQueue
+from app.domain.session.ports.conversation_store import ConversationStore
 from app.infrastructure.cache.cached_embedding_client import CachedEmbeddingClient
 from app.infrastructure.cache.redis_cache import RedisCache
 from app.infrastructure.cache.semantic_cache import SemanticCache
 from app.infrastructure.embedding.openai_embedding_client import OpenAIEmbeddingClient
 from app.infrastructure.eventbus import TradeEventBus
+from app.infrastructure.llm import create_semantic_title_model
 from app.infrastructure.persistence.in_memory_repositories import (
     InMemoryOrderRepository,
     InMemoryProductRepository,
@@ -92,6 +95,7 @@ class Container:
     settings: Settings
     bus: TradeEventBus
     orchestrator: MainAgentOrchestrator
+    conversation_store: ConversationStore
     cache: RedisCache
     semantic_cache: SemanticCache
     task_queue: Optional[TaskQueue]
@@ -105,12 +109,23 @@ class Container:
     db_engine: Any
 
     async def startup(self) -> None:
-        """建表 / 建向量库 / 建知识库。任一失败只告警，对应能力降级但服务可用。"""
+        """建表（迁移）/ 建向量库 / 建知识库。任一失败只告警，对应能力降级但服务可用。"""
         if self.db_engine is not None:
             try:
-                await bootstrap_schema(self.db_engine)
+                # F3：建表职责交给 Alembic（upgrade head）。
+                # 老库（create_all 时代建的表、无 alembic_version）也能安全升迁：
+                # baseline 用 create_all 幂等建表（已有表跳过），增量带列存在性守卫，
+                # 只在缺列时补列。见 alembic/versions/ 与 sql/migrate.py。
+                from app.infrastructure.persistence.sql.migrate import upgrade_head
+
+                await upgrade_head()
+                logger.info("数据库迁移已执行（alembic upgrade head）")
             except Exception as err:  # noqa: BLE001
-                logger.warning("数据库建表失败，持久化能力不可用：%s", err)
+                logger.warning("Alembic 迁移失败，回退 create_all 兜底：%s", err)
+                try:
+                    await bootstrap_schema(self.db_engine)
+                except Exception as fallback_err:  # noqa: BLE001
+                    logger.warning("数据库建表失败，持久化能力不可用：%s", fallback_err)
         if isinstance(self.task_queue, RedisStreamTaskQueue):
             try:
                 await self.task_queue.ensure_group()
@@ -233,6 +248,9 @@ async def build_container() -> Container:
         preference_selector=preference_selector,
     )
     sessions = SessionRegistry(main_factory, session_store)
+    # F3 会话自动标题：模型用备用小模型，不跟 Agent 主链路抢配额。
+    # 模型为 None（无凭据环境）时语义标题跳过，标题停在兜底截断。
+    auto_titler = AutoTitler(model=create_semantic_title_model(settings))
     orchestrator = MainAgentOrchestrator(
         sessions, bus, preference_store, conversation_store, semantic_cache,
         output_guard_enabled=settings.output_guard_enabled,
@@ -241,12 +259,14 @@ async def build_container() -> Container:
         drift_detector=drift_detector,
         preference_selector=preference_selector,
         preference_top_k=settings.preference_top_k,
+        auto_titler=auto_titler,
     )
 
     return Container(
         settings=settings,
         bus=bus,
         orchestrator=orchestrator,
+        conversation_store=conversation_store,
         cache=cache,
         semantic_cache=semantic_cache,
         task_queue=task_queue,

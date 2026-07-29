@@ -142,6 +142,19 @@ class TestConversationStore:
         assert len(await store.list_turns("s1")) == 2
         assert len(await store.list_turns("s2")) == 1
 
+    async def test_list_turns_returns_tail_not_head(self, engine):
+        """limit 语义是「最近 N 轮」不是「最早 N 轮」（B1，对齐文件形态的 turns[-limit:]）。"""
+        store = SqlConversationStore(engine)
+        await store.touch_session("s1", "buyer-001", "zh-CN", "CNY")
+        for index in range(10):
+            await store.append_turn(
+                ConversationTurn(
+                    session_id="s1", buyer_id="buyer-001", role="buyer", content=f"第{index}轮",
+                ),
+            )
+        turns = await store.list_turns("s1", limit=3)
+        assert [turn.content for turn in turns] == ["第7轮", "第8轮", "第9轮"]
+
     async def test_events_persisted_with_payload(self, engine):
         store = SqlConversationStore(engine)
         await store.append_events(
@@ -163,6 +176,86 @@ class TestConversationStore:
 
     async def test_empty_events_is_noop(self, engine):
         await SqlConversationStore(engine).append_events([])
+
+
+class TestSessionCrud:
+    """F3：会话列表 / 重命名 / 软删 / 自动标题锁。"""
+
+    async def test_list_excludes_deleted_and_other_buyers(self, engine):
+        store = SqlConversationStore(engine)
+        await store.touch_session("s1", "buyer-001", "zh-CN", "CNY")
+        await store.touch_session("s2", "buyer-001", "zh-CN", "CNY")
+        await store.touch_session("s-other", "buyer-002", "zh-CN", "CNY")
+        await store.soft_delete_session("s2")
+
+        ids = [summary.session_id for summary in await store.list_sessions("buyer-001")]
+        assert ids == ["s1"]  # 软删 + 他人会话都不出现
+
+    async def test_fallback_title_written_once_until_rename(self, engine):
+        store = SqlConversationStore(engine)
+        await store.touch_session("s1", "buyer-001", "zh-CN", "CNY")
+        assert await store.set_fallback_title("s1", "兜底标题") is True
+        assert await store.set_fallback_title("s1", "不应覆盖") is False  # title 非空即不写
+
+        session = await store.find_session("s1")
+        assert session["title"] == "兜底标题"
+        assert session["title_custom"] is False
+
+    async def test_rename_marks_custom_and_blocks_auto_title(self, engine):
+        store = SqlConversationStore(engine)
+        await store.touch_session("s1", "buyer-001", "zh-CN", "CNY")
+        await store.set_fallback_title("s1", "兜底标题")
+        assert await store.rename_session("s1", "用户改名") is True
+
+        session = await store.find_session("s1")
+        assert session["title"] == "用户改名"
+        assert session["title_custom"] is True
+
+        # 语义标题回写：用户已改名（title_custom=True）→ 同一条 UPDATE 命中 0 行
+        assert await store.set_auto_title("s1", "LLM 标题", only_if_not_custom=True) is False
+        session = await store.find_session("s1")
+        assert session["title"] == "用户改名"
+
+    async def test_auto_title_applies_when_not_custom(self, engine):
+        store = SqlConversationStore(engine)
+        await store.touch_session("s1", "buyer-001", "zh-CN", "CNY")
+        await store.set_fallback_title("s1", "兜底标题")
+        assert await store.set_auto_title("s1", "语义标题", only_if_not_custom=True) is True
+
+        session = await store.find_session("s1")
+        assert session["title"] == "语义标题"
+        assert session["title_custom"] is False
+
+    async def test_soft_delete_keeps_turns_and_is_idempotent(self, engine):
+        store = SqlConversationStore(engine)
+        await store.touch_session("s1", "buyer-001", "zh-CN", "CNY")
+        await store.append_turn(
+            ConversationTurn(session_id="s1", buyer_id="buyer-001", role="buyer", content="你好"),
+        )
+        assert await store.soft_delete_session("s1") is True
+        assert await store.soft_delete_session("s1") is False  # 已删视为不存在
+
+        assert await store.list_sessions("buyer-001") == []
+        # badcase 数据底座：消息仍在
+        assert len(await store.list_turns("s1")) == 1
+
+    async def test_rename_missing_returns_false(self, engine):
+        assert await SqlConversationStore(engine).rename_session("nope", "标题") is False
+
+    async def test_soft_deleted_session_rejects_rename_and_title_writes(self, engine):
+        """软删是终态：改名 / 兜底标题 / 语义标题对已删会话一律命中 0 行，标题不被改写（B7）。"""
+        store = SqlConversationStore(engine)
+        await store.touch_session("s1", "buyer-001", "zh-CN", "CNY")
+        await store.set_fallback_title("s1", "兜底标题")
+        assert await store.soft_delete_session("s1") is True
+
+        assert await store.rename_session("s1", "不应写入") is False
+        assert await store.set_fallback_title("s1", "不应写入") is False
+        assert await store.set_auto_title("s1", "不应写入", only_if_not_custom=False) is False
+
+        session = await store.find_session("s1")
+        assert session["title"] == "兜底标题"  # 三次拒绝都没偷偷改写标题
+        assert session["deleted_at"] is not None
 
 
 class TestOrderRepository:

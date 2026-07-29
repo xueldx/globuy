@@ -1,150 +1,499 @@
 import { create } from "zustand";
-import type { ChatMessage, ChatMessageStatus, SessionSummary, TradeEventType } from "@/types";
-import { streamIntent } from "@/services/commerce";
+import type { ChatMessage, ChatMessageStatus, SessionSummary, SessionTurn, TradeEventType } from "@/types";
+import { ApiError } from "@/lib/api";
+import {
+  DEMO_BUYER_ID,
+  deleteSession as apiDeleteSession,
+  fetchTurns,
+  listSessions,
+  renameSession as apiRenameSession,
+  streamIntent,
+} from "@/services/commerce";
 import { useAgentProcessStore } from "./agentProcessStore";
 
+/**
+ * F3 会话状态机（分片 + 后台持流 + 服务端真相源）
+ *
+ * 设计要点（详见 AICoding/02-会话状态机/决策.md D1–D12）：
+ *
+ * 1. 分片：一切按 sessionId 归位。messages/流式文本/守卫消息 id/状态都是
+ *    `...BySession` 记录，切会话不可能串消息——token 永远写进自己的分片。
+ * 2. 后台持流：activeStreams 是模块级 Map（不进 zustand，selector 不会因此空转）。
+ *    切换会话**不 abort**：Agent 任务不随前端连接死，事件无人订阅即丢弃，
+ *    所以切走的会话只是没有组件订阅它，流照常收、照常写分片；谁订阅谁看到。
+ * 3. 派生 isStreaming：statusBySession[sid] === "streaming" ⇔ 该会话在流。
+ *    不做独立的 isStreaming 布尔，消灭「一个真一个假」的失同步。
+ * 4. 并发上限：HTTP/1.1 同域 6 连接，3 条流已经占掉一半，超限**明确拒绝**，
+ *    不排队（排队会像页面卡死）。列表/历史/PATCH/DELETE 永远有额度。
+ * 5. 竞态三件套全部 per-session：幂等守卫（挡 StrictMode 双挂载）、await 之后
+ *    回查 currentSessionId、finally 再回查才重置标志。
+ */
 export interface ChatState {
+  /** 会话列表（服务端为真相源，本状态只是缓存） */
   sessions: SessionSummary[];
+  sessionsLoaded: boolean;
+  sessionsLoading: boolean;
+  sessionsFailed: boolean;
   currentSessionId: string | null;
-  /** 已提交消息列表。流式增量不写进这里——保证每来一个 token 消息列表不重渲染 */
-  messages: ChatMessage[];
-  /** 竞态守卫：流式回调只对「当前激活消息」生效（F3 补完整状态机） */
-  streamingMessageId: string | null;
-  /** 激活消息的实时文本。只此字段随 token 高频更新 → 只有订阅它的气泡组件重渲染（增量渲染核心） */
-  streamingContent: string;
-  isStreaming: boolean;
+  /** per-session 分片：每条激活流只写自己那格的增量/文本/消息 */
+  messagesBySession: Record<string, ChatMessage[]>;
+  streamingMsgIdBySession: Record<string, string>;
+  streamingBySession: Record<string, string>;
+  statusBySession: Record<string, ChatMessageStatus | null>;
+  /** 历史拉取进行中（幂等守卫的开关） */
+  loadingBySession: Record<string, boolean>;
+  /** 全局一次性提示（并发超限 / 删除失败等） */
+  notice: string | null;
   setCurrentSession: (id: string | null) => void;
-  /** 发送购物意图并启动 SSE 流式输出 */
-  sendMessage: (rawQuery: string) => Promise<void>;
-  /** 停止当前生成（abort） */
-  stopStream: () => void;
+  loadSessions: () => Promise<void>;
+  selectSession: (sessionId: string) => Promise<void>;
+  /** 对当前会话发送意图并启动 SSE 流；被并发上限拒绝时返回 false */
+  sendMessage: (rawQuery: string) => Promise<boolean>;
+  /** 停止指定会话（默认当前）的生成：abort 让 sendMessage 的 catch 走 cancelled 收口 */
+  stopStream: (sessionId?: string) => void;
+  /** 乐观重命名，失败回滚并返回 false */
+  renameSession: (sessionId: string, title: string) => Promise<boolean>;
+  /** 删除：先掐流 → 乐观移除列表 → DELETE。服务端确认（含 404 幂等）才清分片并返回 true；
+   *  失败回滚列表返回 false。已断的流不复活（abort 的轮已在 catch 收口为 cancelled）。 */
+  deleteSession: (sessionId: string) => Promise<boolean>;
+  dismissNotice: () => void;
 }
+
+/** 并发流上限（决策 D10：明确拒绝不排队） */
+export const MAX_CONCURRENT_STREAMS = 3;
+
+/**
+ * 删除墓碑：页生命周期内保留「正在/已经删除」的会话 id。
+ * 挡住并发 loadSessions 把「DELETE 还在路上 / 刚删掉」的会话从服务端旧快照合并回列表（幽灵条目）。
+ * 只存 id 字符串、只增不减，量级=一次页面会话的删除次数，可忽略；刷新即清空。
+ */
+const deletingIds = new Set<string>();
 
 function makeId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-// 模块级：同一时刻只有一条激活流（sendMessage 以 isStreaming 互斥），stopStream 据此 abort
-let currentController: AbortController | null = null;
+function nowISO(): string {
+  return new Date().toISOString();
+}
 
-export const useChatStore = create<ChatState>((set, get) => ({
-  sessions: [],
-  currentSessionId: null,
-  messages: [],
-  streamingMessageId: null,
-  streamingContent: "",
-  isStreaming: false,
-  setCurrentSession: (id) => set({ currentSessionId: id }),
+function fallbackTitle(query: string): string {
+  const collapsed = query.replace(/\s+/g, " ").trim();
+  return collapsed.length > 30 ? `${collapsed.slice(0, 30)}…` : collapsed;
+}
 
-  sendMessage: async (rawQuery) => {
-    const query = rawQuery.trim();
-    if (!query || get().isStreaming) return;
+/** 服务端历史轮（buyer/agent）→ 前端消息（user/assistant）。id 用会话内序号稳定生成，重拉不抖。 */
+function turnsToMessages(sessionId: string, turns: SessionTurn[]): ChatMessage[] {
+  return turns.map((turn, index) => ({
+    id: `${sessionId}:h${index}:${turn.role}`,
+    role: turn.role === "buyer" ? "user" : "assistant",
+    content: turn.content,
+    status: "done" as const,
+    createdAt: turn.created_at,
+  }));
+}
 
-    // 首次对话时兜底生成会话（F3 接入服务端会话管理/持久化）
-    const sessionId = get().currentSessionId ?? `session-${Date.now().toString(36)}`;
-    if (!get().currentSessionId) set({ currentSessionId: sessionId });
+// ---- 不可变 record 小工具（zustand 状态不许原地改）----
+function setKey<T>(map: Record<string, T>, key: string, value: T): Record<string, T> {
+  return { ...map, [key]: value };
+}
+function delKey<T>(map: Record<string, T>, key: string): Record<string, T> {
+  const next = { ...map };
+  delete next[key];
+  return next;
+}
 
-    const userMsg: ChatMessage = {
-      id: makeId("u"), role: "user", content: query, status: "done", createdAt: new Date().toISOString(),
-    };
-    const assistantMsg: ChatMessage = {
-      id: makeId("a"), role: "assistant", content: "", status: "streaming", createdAt: new Date().toISOString(),
-    };
+/**
+ * 模块级 activeStreams：不进 zustand。
+ * 放进组件可见的状态会让每个无关订阅者跟着空转，而控制器本身也不可序列化。
+ * devtools 可观测、HMR 安全——Map 生命周期与 store 解耦，页面关掉任务自然结束。
+ */
+const activeStreams = new Map<string, AbortController>();
 
+// 一次性提示的自动熄灭定时器
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+function flashNotice(set: (partial: Partial<ChatState>) => void, text: string) {
+  set({ notice: text });
+  if (noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => set({ notice: null }), 4000);
+}
+
+export const useChatStore = create<ChatState>((set, get) => {
+  /** 把一条消息定型进它的分片并清掉流式状态（done/cancelled/error 三态唯一收口） */
+  function finalizeStream(sessionId: string, messageId: string, status: ChatMessageStatus) {
+    // 竞态守卫：该消息已经不是这条会话的激活流（被新消息顶替 / 会话已删除）→ 丢弃
+    if (get().streamingMsgIdBySession[sessionId] !== messageId) return;
+    const content = get().streamingBySession[sessionId] ?? "";
     set((s) => ({
-      messages: [...s.messages, userMsg, assistantMsg],
-      isStreaming: true,
-      streamingMessageId: assistantMsg.id,
-      streamingContent: "",
+      messagesBySession: {
+        ...s.messagesBySession,
+        [sessionId]: (s.messagesBySession[sessionId] ?? []).map((m) =>
+          m.id === messageId ? { ...m, content, status } : m,
+        ),
+      },
+      streamingBySession: delKey(s.streamingBySession, sessionId),
+      streamingMsgIdBySession: delKey(s.streamingMsgIdBySession, sessionId),
+      statusBySession: delKey(s.statusBySession, sessionId),
     }));
+  }
 
-    const controller = new AbortController();
-    currentController = controller;
+  return {
+    sessions: [],
+    sessionsLoaded: false,
+    sessionsLoading: false,
+    sessionsFailed: false,
+    currentSessionId: null,
+    messagesBySession: {},
+    streamingMsgIdBySession: {},
+    streamingBySession: {},
+    statusBySession: {},
+    loadingBySession: {},
+    notice: null,
 
-    // 竞态守卫：只认「当前激活消息」，杜绝 A 请求的 token 写进 B 消息
-    const isActive = () => get().streamingMessageId === assistantMsg.id;
+    dismissNotice: () => set({ notice: null }),
 
-    /** 收口：把流式文本定型进消息并清空守卫（done/cancelled/error 三态统一走这里） */
-    const finish = (status: ChatMessageStatus) => {
-      if (!isActive()) return;
-      const content = get().streamingContent;
-      set((s) => ({
-        messages: s.messages.map((m) => (m.id === assistantMsg.id ? { ...m, content, status } : m)),
-        isStreaming: false,
-        streamingMessageId: null,
-        streamingContent: "",
-      }));
-    };
+    setCurrentSession: (id) => set({ currentSessionId: id }),
 
-    try {
-      await streamIntent(
-        {
-          shopping_session_id: sessionId,
-          buyer_id: "demo-buyer",
-          locale: "zh-CN",
-          currency: "CNY",
-          raw_query: query,
-        },
-        {
-          onEvent: (event, payload) => {
-            if (!isActive()) return;
-            switch (event) {
-              case "token.delta": {
-                const token = (payload as { token?: string }).token ?? "";
-                if (!token) return;
-                // 只更新 streamingContent：messages 引用不变 → 消息列表零重渲染
-                set((s) => ({ streamingContent: s.streamingContent + token }));
-                break;
-              }
-              case "final.result": {
-                const text = (payload as { text?: string }).text;
-                if (typeof text === "string") set({ streamingContent: text });
-                finish("done");
-                break;
-              }
-              case "error": {
-                const message = (payload as { error?: string })?.error;
-                if (message) set({ streamingContent: message });
-                finish("error");
-                break;
-              }
-              default:
-                // 过程事件（agent.dispatch/tool.*/plan.update/...）入库，F6 渲染
-                if (typeof payload === "object" && payload !== null) {
-                  useAgentProcessStore.getState().pushEvent({
-                    type: event as TradeEventType,
-                    payload: payload as Record<string, unknown>,
-                    occurred_at: new Date().toISOString(),
-                  });
-                }
-            }
-          },
-          onError: (err) => {
-            // 重试耗尽等真实错误；abort 走 catch，不在此处理
-            if (!isActive() || controller.signal.aborted) return;
-            set({ streamingContent: get().streamingContent || `[error] ${err.message}` });
-            finish("error");
-          },
-        },
-        controller.signal,
-      );
-
-      // 正常收流但未收到 final.result（服务端异常关闭）：统一收口
-      if (isActive()) finish(controller.signal.aborted ? "cancelled" : "done");
-    } catch (err) {
-      if (!isActive()) return;
-      // abort（用户点停止）→ cancelled；其他（fetch 失败等）→ error
-      if (controller.signal.aborted) finish("cancelled");
-      else {
-        set({ streamingContent: get().streamingContent || `[error] ${(err as Error).message}` });
-        finish("error");
+    loadSessions: async () => {
+      set({ sessionsLoading: true });
+      try {
+        const server = await listSessions(DEMO_BUYER_ID);
+        // 合并策略：服务端列表是真相源，但保留「还没被服务端收录」的本地会话
+        //（刚发首轮、流还没走完持久化的新会话）——否则刷新会把正在聊的会话刷没。
+        const g = get();
+        const keptLocal = g.sessions.filter(
+          (local) =>
+            !server.some((item) => item.id === local.id) &&
+            ((g.messagesBySession[local.id]?.length ?? 0) > 0 ||
+              g.statusBySession[local.id] === "streaming"),
+        );
+        const merged = [...server, ...keptLocal]
+          .filter((item) => !deletingIds.has(item.id)) // 幽灵条目守卫：删除确认前不把旧快照刷回列表
+          .sort((a, b) => (b.last_active_at || "").localeCompare(a.last_active_at || ""));
+        set({ sessions: merged, sessionsLoaded: true, sessionsFailed: false });
+      } catch (err) {
+        set({ sessionsLoaded: true, sessionsFailed: true });
+        flashNotice(set, `会话列表加载失败：${(err as Error).message}`);
+      } finally {
+        set({ sessionsLoading: false });
       }
-    } finally {
-      if (currentController === controller) currentController = null;
-    }
-  },
+    },
 
-  stopStream: () => {
-    currentController?.abort();
-  },
-}));
+    selectSession: async (sessionId) => {
+      const state = get();
+      // ① 幂等守卫：正在看同一个会话且分片已有内容 → 不重拉（顺带挡 StrictMode 双挂载）
+      if (
+        state.currentSessionId === sessionId &&
+        (state.messagesBySession[sessionId]?.length ?? 0) > 0
+      ) {
+        return;
+      }
+      // 切换查看的会话：清空上一会话的过程事件时间线（events 无界累积防护；F6 落地时按 sessionId 归位）
+      if (state.currentSessionId && state.currentSessionId !== sessionId) {
+        useAgentProcessStore.getState().reset();
+      }
+      // ② 已有活跃流 → 本地分片就是真相（当轮还没落库，拉历史会抹掉增长中的文本）
+      if (activeStreams.has(sessionId)) {
+        set({ currentSessionId: sessionId });
+        return;
+      }
+      set({ currentSessionId: sessionId });
+      // ③ 历史已缓存 → 直接渲染本地
+      if ((state.messagesBySession[sessionId]?.length ?? 0) > 0) return;
+      // 拉取中 → 不重复发请求
+      if (state.loadingBySession[sessionId]) return;
+
+      set((s) => ({ loadingBySession: setKey(s.loadingBySession, sessionId, true) }));
+      try {
+        const turns = await fetchTurns(sessionId);
+        // await 之后回查：期间用户又切走了 → 丢弃这份结果，不许污染别人的视图
+        if (get().currentSessionId !== sessionId) return;
+        set((s) => {
+          const local = s.messagesBySession[sessionId] ?? [];
+          // 合并而非覆盖：拉历史期间该会话可能已发出新一轮（本地分片有了刚发的消息）。
+          // 服务端历史在前、本地轮在后拼接——整片覆盖会把刚发的本轮消息抹掉（历史拉取 vs 发送竞态）。
+          return {
+            messagesBySession: setKey(s.messagesBySession, sessionId, [
+              ...turnsToMessages(sessionId, turns),
+              ...local,
+            ]),
+          };
+        });
+      } catch {
+        // 会话已在服务端被删/不存在：保留空分片 + 提示
+        if (get().currentSessionId === sessionId) {
+          flashNotice(set, "该会话已不存在（可能已被删除）");
+          set((s) => ({
+            messagesBySession: setKey(s.messagesBySession, sessionId, []),
+            sessions: s.sessions.filter((item) => item.id !== sessionId),
+          }));
+        }
+      } finally {
+        // finally 里再回查：无论有没有切走都释放 loading，让后续 select 能重新拉
+        set((s) => ({ loadingBySession: delKey(s.loadingBySession, sessionId) }));
+      }
+    },
+
+    sendMessage: async (rawQuery) => {
+      const query = rawQuery.trim();
+      if (!query) return false;
+      // 决策 D10：超限明确拒绝，不排队（排队看起来像页面死了）。
+      // 用「仍在生成的消息数」而非 activeStreams.size——收尾窗口（final.result 已到但 SSE 未关）
+      // activeStreams 还有条目，会短暂误拒第 4 条
+      const activeGenerating = Object.values(get().streamingMsgIdBySession).filter(Boolean).length;
+      if (activeGenerating >= MAX_CONCURRENT_STREAMS) {
+        flashNotice(set, `同时在跑 ${MAX_CONCURRENT_STREAMS} 条 Agent 任务，请等其中一条完成后重试`);
+        return false;
+      }
+      const state = get();
+      let sessionId = state.currentSessionId;
+      if (sessionId && state.statusBySession[sessionId] === "streaming") return false;
+
+      // 新聊天（无当前会话）：客户端先占一个临时 id——服务端首轮就会用这个 id 建会话，
+      // 首轮结束兜底标题写入后由 loadSessions 合并回来（见其 keptLocal 逻辑）
+      let wasKnown = !!sessionId && state.sessions.some((item) => item.id === sessionId);
+      if (!sessionId) {
+        const placeholderId = `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        sessionId = placeholderId; // 闭包外完成窄化；set 回调里引用 const，避免 string|null 投诉
+        const timestamp = nowISO();
+        set((s) => ({
+          currentSessionId: placeholderId,
+          messagesBySession: setKey(s.messagesBySession, placeholderId, []),
+          sessions: [
+            {
+              id: placeholderId,
+              title: fallbackTitle(query),
+              created_at: timestamp,
+              last_active_at: timestamp,
+            },
+            ...s.sessions,
+          ],
+        }));
+      }
+
+      const sid = sessionId;
+      const userMsg: ChatMessage = {
+        id: makeId("u"),
+        role: "user",
+        content: query,
+        status: "done",
+        createdAt: nowISO(),
+      };
+      const assistantMsg: ChatMessage = {
+        id: makeId("a"),
+        role: "assistant",
+        content: "",
+        status: "streaming",
+        createdAt: nowISO(),
+      };
+      set((s) => ({
+        messagesBySession: {
+          ...s.messagesBySession,
+          [sid]: [...(s.messagesBySession[sid] ?? []), userMsg, assistantMsg],
+        },
+        streamingMsgIdBySession: setKey(s.streamingMsgIdBySession, sid, assistantMsg.id),
+        streamingBySession: setKey(s.streamingBySession, sid, ""),
+        statusBySession: setKey(s.statusBySession, sid, "streaming"),
+      }));
+
+      const controller = new AbortController();
+      activeStreams.set(sid, controller);
+      // 竞态守卫（per-session）：A 的 token 只写 A 的分片，且只在还是激活消息时才写
+      const isActive = () => get().streamingMsgIdBySession[sid] === assistantMsg.id;
+
+      const finalize = (status: ChatMessageStatus) => {
+        finalizeStream(sid, assistantMsg.id, status);
+        // 新会话首轮收流：服务端轮末才落库并写兜底标题，稍等一拍再刷新列表
+        if (status === "done" && !wasKnown) {
+          setTimeout(() => void get().loadSessions(), 1400);
+        }
+      };
+
+      try {
+        await streamIntent(
+          {
+            shopping_session_id: sid,
+            buyer_id: DEMO_BUYER_ID,
+            locale: "zh-CN",
+            currency: "CNY",
+            raw_query: query,
+          },
+          {
+            onEvent: (event, payload) => {
+              if (!isActive()) return;
+              switch (event) {
+                case "token.delta": {
+                  const token = (payload as { token?: string }).token ?? "";
+                  if (!token) return;
+                  // 只更新本会话分片的文本：别的会话分片与消息列表引用都不动
+                  set((s) => ({
+                    streamingBySession: setKey(
+                      s.streamingBySession,
+                      sid,
+                      (s.streamingBySession[sid] ?? "") + token,
+                    ),
+                  }));
+                  break;
+                }
+                case "final.result": {
+                  const text = (payload as { text?: string }).text;
+                  if (typeof text === "string") {
+                    set((s) => ({
+                      streamingBySession: setKey(s.streamingBySession, sid, text),
+                    }));
+                  }
+                  finalize("done");
+                  break;
+                }
+                case "error": {
+                  // 服务端真实错误帧用 {message}（orchestrator 校验拦截 / 异常回退）；
+                  // 只有 SSE 超时的合成帧用 {error}。两个 key 都读，别让真实错误只剩空气泡。
+                  const data = payload as { error?: string; message?: string };
+                  const message = data.error ?? data.message;
+                  if (message) {
+                    set((s) => ({
+                      streamingBySession: setKey(s.streamingBySession, sid, message),
+                    }));
+                  }
+                  finalize("error");
+                  break;
+                }
+                default:
+                  // 过程事件：只喂给「当前在看的会话」的时间线（agentProcessStore 未分片，
+                  // 后台流的入账是 F6 的活；这里不喂就不会串到别的会话视图）
+                  if (
+                    get().currentSessionId === sid &&
+                    typeof payload === "object" &&
+                    payload !== null
+                  ) {
+                    useAgentProcessStore.getState().pushEvent({
+                      type: event as TradeEventType,
+                      payload: payload as Record<string, unknown>,
+                      occurred_at: nowISO(),
+                    });
+                  }
+              }
+            },
+            onError: (err) => {
+              // 重试耗尽等真实错误；主动 abort 走 catch，不在此处理
+              if (!isActive() || controller.signal.aborted) return;
+              const text = get().streamingBySession[sid] || `[error] ${err.message}`;
+              set((s) => ({ streamingBySession: setKey(s.streamingBySession, sid, text) }));
+              finalize("error");
+            },
+          },
+          controller.signal,
+        );
+        // 正常收流但没等来 final.result（服务端异常关闭）：统一收口
+        if (isActive()) finalize(controller.signal.aborted ? "cancelled" : "done");
+      } catch (err) {
+        // abort（用户点停止 / 删除掐流）→ cancelled；其他（fetch 失败等）→ error
+        if (!isActive()) return true;
+        if (controller.signal.aborted) finalize("cancelled");
+        else {
+          const text =
+            get().streamingBySession[sid] || `[error] ${(err as Error)?.message ?? "请求失败"}`;
+          set((s) => ({ streamingBySession: setKey(s.streamingBySession, sid, text) }));
+          finalize("error");
+        }
+      } finally {
+        // 只删自己这个 controller：不误伤同会话新起的流（本版本同会话同一时刻仅一条）
+        if (activeStreams.get(sid) === controller) activeStreams.delete(sid);
+      }
+      return true;
+    },
+
+    stopStream: (sessionId) => {
+      const sid = sessionId ?? get().currentSessionId;
+      if (!sid) return;
+      // 只 abort 不断任何状态：sendMessage 的 catch 会以 cancelled 收口并清掉流式标志
+      activeStreams.get(sid)?.abort();
+    },
+
+    renameSession: async (sessionId, title) => {
+      const session = get().sessions.find((item) => item.id === sessionId);
+      if (!session) return false;
+      const previousTitle = session.title;
+      // 乐观更新：标题立刻上屏，失败再回滚
+      set((s) => ({
+        sessions: s.sessions.map((item) => (item.id === sessionId ? { ...item, title } : item)),
+      }));
+      try {
+        const updated = await apiRenameSession(sessionId, title);
+        set((s) => ({
+          sessions: s.sessions.map((item) =>
+            item.id === sessionId
+              ? {
+                  ...item,
+                  title: updated.title,
+                  created_at: updated.created_at || item.created_at,
+                  last_active_at: updated.last_active_at || item.last_active_at,
+                }
+              : item,
+          ),
+        }));
+        return true;
+      } catch (err) {
+        // 失败只回滚标题（乐观更新的回滚边界）
+        set((s) => ({
+          sessions: s.sessions.map((item) =>
+            item.id === sessionId ? { ...item, title: previousTitle } : item,
+          ),
+        }));
+        flashNotice(set, `重命名失败：${(err as Error).message}`);
+        return false;
+      }
+    },
+
+    deleteSession: async (sessionId) => {
+      const wasCurrent = get().currentSessionId === sessionId;
+      const previousSessions = get().sessions;
+
+      // ① 先掐流（abort 不可逆：先掐防僵尸写入；失败也不复活——该轮已在 abort 的 catch 收口为 cancelled）
+      const controller = activeStreams.get(sessionId);
+      if (controller) {
+        controller.abort();
+        activeStreams.delete(sessionId);
+      }
+      // ② 墓碑：挡住 in-flight 的 loadSessions 把「刚删/删中」的会话从服务端旧快照刷回列表（幽灵条目）
+      deletingIds.add(sessionId);
+      // ③ 乐观移除列表 + 置空当前会话。**分片暂不清**：失败回滚后 UI 回到原样，不必重拉历史。
+      set((s) => ({
+        sessions: s.sessions.filter((item) => item.id !== sessionId),
+        currentSessionId: wasCurrent ? null : s.currentSessionId,
+      }));
+
+      // ④ 服务端确认（含 404 幂等）后才清分片；删的是当前会话则顺带清掉它的过程时间线
+      const commitRemoval = () => {
+        if (wasCurrent) useAgentProcessStore.getState().reset();
+        set((s) => ({
+          messagesBySession: delKey(s.messagesBySession, sessionId),
+          streamingMsgIdBySession: delKey(s.streamingMsgIdBySession, sessionId),
+          streamingBySession: delKey(s.streamingBySession, sessionId),
+          statusBySession: delKey(s.statusBySession, sessionId),
+          loadingBySession: delKey(s.loadingBySession, sessionId),
+        }));
+      };
+
+      try {
+        await apiDeleteSession(sessionId);
+      } catch (err) {
+        // 404 = 服务端本就没有该会话（幂等删除），本地已移除即视为成功
+        if (err instanceof ApiError && err.status === 404) {
+          commitRemoval();
+          return true;
+        }
+        // 真失败：回滚列表与当前会话；分片从没动过，回来仍是原样。已断的流不复活。
+        deletingIds.delete(sessionId);
+        set((s) => ({
+          sessions: previousSessions,
+          currentSessionId: wasCurrent && s.currentSessionId === null ? sessionId : s.currentSessionId,
+        }));
+        flashNotice(set, `删除失败：${(err as Error).message}`);
+        return false;
+      }
+      commitRemoval();
+      return true;
+    },
+  };
+});

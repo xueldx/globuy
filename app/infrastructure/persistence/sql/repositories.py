@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
-from sqlalchemy import delete, event, func, select
+from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -37,6 +37,7 @@ from app.domain.session.ports.conversation_store import (
     ConversationEventRecord,
     ConversationStore,
     ConversationTurn,
+    SessionSummary,
 )
 from app.domain.session.ports.session_store import SessionStore
 from app.infrastructure.persistence.sql.tables import (
@@ -164,11 +165,13 @@ class SqlConversationStore(ConversationStore):
                 await db.scalars(
                     select(ConversationMessageRow)
                     .where(ConversationMessageRow.session_id == session_id)
-                    .order_by(ConversationMessageRow.turn_index)
+                    # 先降序取「最近 limit 轮」，再在下面反转为升序：
+                    # 语义与 JsonFile 形态的 turns[-limit:] 一致（客户端永远要尾巴那一段）
+                    .order_by(ConversationMessageRow.turn_index.desc())
                     .limit(limit),
                 )
             ).all()
-        return [
+        turns = [
             ConversationTurn(
                 session_id=row.session_id,
                 buyer_id=row.buyer_id,
@@ -180,6 +183,8 @@ class SqlConversationStore(ConversationStore):
             )
             for row in rows
         ]
+        turns.reverse()
+        return turns
 
     async def find_session(self, session_id: str) -> Optional[dict]:
         async with self._session_factory() as db:
@@ -191,8 +196,113 @@ class SqlConversationStore(ConversationStore):
                 "buyer_id": row.buyer_id,
                 "locale": row.locale,
                 "currency": row.currency,
+                "title": row.title or "",
+                "title_custom": bool(row.title_custom),
+                "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
+                "created_at": row.created_at.isoformat() if row.created_at else "",
                 "last_active_at": row.last_active_at.isoformat() if row.last_active_at else "",
             }
+
+    async def list_sessions(self, buyer_id: str, limit: int = 50) -> list[SessionSummary]:
+        async with self._session_factory() as db:
+            rows = (
+                await db.scalars(
+                    select(ConversationSessionRow)
+                    .where(
+                        ConversationSessionRow.buyer_id == buyer_id,
+                        ConversationSessionRow.deleted_at.is_(None),
+                    )
+                    .order_by(ConversationSessionRow.last_active_at.desc())
+                    .limit(limit),
+                )
+            ).all()
+        return [
+            SessionSummary(
+                session_id=row.session_id,
+                buyer_id=row.buyer_id,
+                title=row.title or "",
+                created_at=row.created_at.isoformat() if row.created_at else "",
+                last_active_at=row.last_active_at.isoformat() if row.last_active_at else "",
+            )
+            for row in rows
+        ]
+
+    async def _active_row_exists(self, db: Any, session_id: str) -> bool:
+        """会话是否存在且未软删。rename/soft_delete 在 UPDATE 命中 0 行时用来
+        区分「会话不存在」与「改成了同样的值」——后者不该误报 404。"""
+        exists = await db.scalar(
+            select(ConversationSessionRow.session_id)
+            .where(
+                ConversationSessionRow.session_id == session_id,
+                ConversationSessionRow.deleted_at.is_(None),
+            )
+            .limit(1),
+        )
+        return exists is not None
+
+    async def rename_session(self, session_id: str, title: str) -> bool:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(ConversationSessionRow)
+                .where(
+                    ConversationSessionRow.session_id == session_id,
+                    ConversationSessionRow.deleted_at.is_(None),
+                )
+                .values(title=title, title_custom=True),
+            )
+            await db.commit()
+            if result.rowcount:
+                return True
+            return await self._active_row_exists(db, session_id)
+
+    async def soft_delete_session(self, session_id: str) -> bool:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(ConversationSessionRow)
+                .where(
+                    ConversationSessionRow.session_id == session_id,
+                    ConversationSessionRow.deleted_at.is_(None),
+                )
+                .values(deleted_at=datetime.now(timezone.utc)),
+            )
+            await db.commit()
+            if result.rowcount:
+                return True
+            return await self._active_row_exists(db, session_id)
+
+    async def set_fallback_title(self, session_id: str, title: str) -> bool:
+        """兜底标题：只在 title 仍为空时写（新会话首轮结束）。"""
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(ConversationSessionRow)
+                .where(
+                    ConversationSessionRow.session_id == session_id,
+                    ConversationSessionRow.deleted_at.is_(None),
+                    ConversationSessionRow.title.is_(None),
+                )
+                .values(title=title),
+            )
+            await db.commit()
+            return bool(result.rowcount)
+
+    async def set_auto_title(
+        self,
+        session_id: str,
+        title: str,
+        only_if_not_custom: bool = True,
+    ) -> bool:
+        async with self._session_factory() as db:
+            stmt = update(ConversationSessionRow).where(
+                ConversationSessionRow.session_id == session_id,
+                ConversationSessionRow.deleted_at.is_(None),
+            )
+            if only_if_not_custom:
+                # 竞态防护：判断放在同一条 UPDATE 的 WHERE 里（title_custom=0 才命中），
+                # 用户恰好在这两步之间重命名 → 本 UPDATE 命中 0 行，自动丢弃语义标题
+                stmt = stmt.where(ConversationSessionRow.title_custom.is_(False))
+            result = await db.execute(stmt.values(title=title))
+            await db.commit()
+            return bool(result.rowcount)
 
 
 class SqlOrderRepository(OrderRepository):

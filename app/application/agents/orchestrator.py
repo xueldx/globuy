@@ -42,6 +42,7 @@ from app.application.memory.preference_selector import (
     render_preference_hint,
     render_preference_lines,
 )
+from app.application.session.auto_title import AutoTitler
 from app.domain.buyer.preference import PreferenceStore
 from app.domain.session.ports.conversation_store import (
     ConversationEventRecord,
@@ -66,6 +67,11 @@ _TASK_TOOL_NAMES = {"TaskCreate", "TaskUpdate", "TaskList", "TaskGet"}
 # （工具、子 Agent 调度、事件消费）招致的瞬时失败。
 _MAX_TURN_RETRIES = 2
 _RETRY_BASE_SECONDS = 6.0
+
+# 自动标题等 fire-and-forget 后台任务的强引用集合：防协程返回后被 GC 提前回收。
+# 与 server.py 的 _track_stream_task / eventbus 的 _broadcast 同一模式，
+# 完成即经 done_callback 移除。
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,7 @@ class MainAgentOrchestrator:
         drift_detector: Optional[DriftDetector] = None,
         preference_selector: Optional[PreferenceSelector] = None,
         preference_top_k: int = 5,
+        auto_titler: Optional[AutoTitler] = None,
     ) -> None:
         self._sessions = sessions
         self._bus = bus
@@ -122,6 +129,7 @@ class MainAgentOrchestrator:
         self._preference_top_k = preference_top_k
         # 会话内已注入的偏好快照，变化时才重新注入，避免每轮重复填充上下文
         self._injected_preferences: dict[str, str] = {}
+        self._auto_titler = auto_titler
 
     def _guard_final_text(self, session_id: str, text: str) -> str:
         """L4 输出审核：最终回复推给买家前脱敏内部信息。
@@ -186,6 +194,8 @@ class MainAgentOrchestrator:
             await self._record_conversation(
                 intent, final_text, int((time.monotonic() - started_at) * 1000), trace,
             )
+            # F3 自动标题：首轮结束兜底立即写库、语义标题后台异步生成（不阻塞本次返回）
+            self._schedule_auto_title(intent, final_text)
             # 循环检测是"本轮内是不是在打转"的判定，轮末必须清零；
             # 阶段无关的顺序记录（SequencingTracker）则按会话保留，
             # 否则第 1 轮检索、第 3 轮下单会被误判为"未检索就下单"。
@@ -296,6 +306,43 @@ class MainAgentOrchestrator:
             await self._conversation_store.append_events(events)
         except Exception as err:  # noqa: BLE001
             logger.warning("对话记录写入失败：%s（%s）", session_id, err)
+
+    def _schedule_auto_title(self, intent: SubmitIntentInput, final_text: str) -> None:
+        """首轮结束后触发自动标题（三段式的编排点）。
+
+        兜底标题由后台任务**同步路径**先写，语义标题再 fire-and-forget——
+        两件事都挂在模块级强引用集合里，协程返回后任务不会被 GC。
+        """
+        if self._conversation_store is None or self._auto_titler is None:
+            return
+        task = asyncio.create_task(
+            self._auto_title_worker(intent.shopping_session_id, intent.raw_query, final_text),
+        )
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    async def _auto_title_worker(self, session_id: str, first_query: str, reply: str) -> None:
+        """兜底标题 → 语义标题的完整回写流程；任一步失败只告警。
+
+        标题是锦上添花，绝不能反向搞坏已经成功返回的这轮对话。
+        """
+        try:
+            fallback = self._auto_titler.fallback_title(first_query)  # type: ignore[union-attr]
+            wrote = await self._conversation_store.set_fallback_title(session_id, fallback)  # type: ignore[union-attr]
+            if not wrote:
+                # 已有标题（多轮会话 / 已命名）→ 不再语义化，避免覆盖
+                return
+            semantic = await self._auto_titler.generate_semantic(  # type: ignore[union-attr]
+                session_id, first_query, reply,
+            )
+            if not semantic:
+                return
+            # title_custom 锁在 store 的 WHERE 里生效：用户已改名则本 UPDATE 命中 0 行
+            await self._conversation_store.set_auto_title(  # type: ignore[union-attr]
+                session_id, semantic, only_if_not_custom=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.warning("自动标题任务失败（会话 %s）：%s", session_id, err)
 
     async def _reply_with_retry(self, session_id: str, agent: Agent, inputs: list[Msg]) -> str:
         """跑一轮 Agent 并映射事件流；上游瞬时错误按指数退避重试。"""

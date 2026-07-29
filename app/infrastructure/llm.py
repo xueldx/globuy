@@ -243,3 +243,25 @@ def create_chat_model(
         bus=bus,
         **common,
     )
+
+
+def create_semantic_title_model(settings: Settings) -> Optional[OpenAIChatModel]:
+    """会话自动标题用的轻量模型：非流式、一答一题，不占流式闸门名额。
+
+    用备用模型（LLM_FALLBACK_MODEL，通常比主模型便宜/配额宽）就够了——
+    起标题不需要主力模型，省得跟 Agent 主链路抢配额。
+    无凭据 / 无模型名时返回 None，语义标题跳过、标题停在兜底截断。
+    """
+    model_name = settings.llm_fallback_model or settings.llm_model
+    if not settings.llm_api_key or not model_name:
+        return None
+    credential = OpenAICredential(
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
+    )
+    return OpenAIChatModel(
+        model=model_name,
+        credential=credential,
+        stream=False,
+        context_size=settings.context_size,
+    )

@@ -51,6 +51,21 @@ class ConversationEventRecord:
     occurred_at: str = field(default_factory=_now_iso)
 
 
+@dataclass(frozen=True)
+class SessionSummary:
+    """侧边栏列表条目。title 可能为空（首轮结束前尚未生成）。"""
+
+    session_id: str
+    buyer_id: str
+    title: str = ""
+    created_at: str = ""
+    last_active_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            raise ValueError("SessionSummary.session_id required")
+
+
 class ConversationStore(ABC):
     @abstractmethod
     async def append_turn(self, turn: ConversationTurn) -> None:
@@ -76,4 +91,41 @@ class ConversationStore(ABC):
 
     @abstractmethod
     async def find_session(self, session_id: str) -> Optional[dict]:
-        """会话主记录，不存在返回 None。"""
+        """会话主记录，不存在返回 None。
+
+        返回字段除主记录外含 title / title_custom / deleted_at（软删时间，
+        非空即视为已删除），供接口层做存在性与已删判断。
+        """
+
+    # ---- F3：会话列表 / 重命名 / 软删 / 自动标题 ----
+
+    @abstractmethod
+    async def list_sessions(self, buyer_id: str, limit: int = 50) -> list[SessionSummary]:
+        """某买家未软删的会话，按最近活跃倒序（截断到 limit）。"""
+
+    @abstractmethod
+    async def rename_session(self, session_id: str, title: str) -> bool:
+        """用户改名：更新 title 并置 title_custom=True。会话不存在/已删返回 False。"""
+
+    @abstractmethod
+    async def soft_delete_session(self, session_id: str) -> bool:
+        """软删：写 deleted_at（messages/events 不动，保 badcase 数据底座）。
+        会话不存在/已删返回 False。"""
+
+    @abstractmethod
+    async def set_fallback_title(self, session_id: str, title: str) -> bool:
+        """首轮兜底标题：只在 title 仍为空的会话上写，不置 title_custom。
+        返回是否真的写入（False = 该会话已有标题/不存在）。"""
+
+    @abstractmethod
+    async def set_auto_title(
+        self,
+        session_id: str,
+        title: str,
+        only_if_not_custom: bool = True,
+    ) -> bool:
+        """异步 LLM 语义标题回写：只在 title_custom=False 的行上生效。
+
+        竞态防护的关键：only_if_not_custom 的判断放在**同一条 UPDATE 的 WHERE**
+        里，而不是先 SELECT 再写——否则用户恰好在这两步之间重命名就会被覆盖。
+        返回该 UPDATE 是否命中（True = 写上了，False = 用户已改名，丢弃）。"""

@@ -9,6 +9,11 @@
     WS   /commerce/events                  订阅会话事件流
     GET  /commerce/orders/{order_id}       查询订单（直连 UseCase，不过 Agent）
     POST /commerce/orders/{order_id}/cancel  取消订单（直连 UseCase）
+    # F3 会话管理（服务端为真相源的读写入口）
+    GET    /commerce/sessions              会话列表（软删排除、最近活跃倒序）
+    GET    /commerce/sessions/{id}/turns   会话历史（已定型消息，轮末才落库）
+    PATCH  /commerce/sessions/{id}         重命名（置 title_custom=True）
+    DELETE /commerce/sessions/{id}         软删会话（messages/events 保留）
     GET  /health                           健康检查（含依赖连通性与队列深度）
 
 启动：
@@ -42,8 +47,11 @@ from app.domain.queue.ports.task_queue import IntentTask, TaskStatus
 from app.presentation.connection import ConnectionManager
 from app.presentation.dto import (
     CancelOrderRequest,
+    RenameSessionRequest,
+    SessionSummaryOut,
     SubmitIntentRequest,
     SubmitIntentResponse,
+    TurnOut,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -233,6 +241,62 @@ def build_app() -> FastAPI:
             return await container().cancel_order.execute(order_id, body.reason)
         except ValueError as err:
             raise HTTPException(status_code=400, detail=str(err)) from err
+
+    # ===== F3 会话管理（服务端为真相源的读写入口）=====
+
+    @api.get("/commerce/sessions", response_model=list[SessionSummaryOut])
+    async def list_sessions(buyer_id: str, limit: int = 50) -> list[SessionSummaryOut]:
+        """买家会话列表：排除软删、按最近活跃倒序（侧边栏数据源）。"""
+        summaries = await container().conversation_store.list_sessions(
+            buyer_id=buyer_id,
+            limit=max(1, min(limit, 200)),
+        )
+        return [
+            SessionSummaryOut(
+                id=summary.session_id,
+                title=summary.title,
+                created_at=summary.created_at,
+                last_active_at=summary.last_active_at,
+            )
+            for summary in summaries
+        ]
+
+    @api.get("/commerce/sessions/{session_id}/turns", response_model=list[TurnOut])
+    async def session_turns(session_id: str, limit: int = 200) -> list[TurnOut]:
+        """会话已定型消息（每轮轮末写入）。正在流的当轮不在其中。"""
+        session = await container().conversation_store.find_session(session_id)
+        if session is None or session.get("deleted_at"):
+            raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
+        turns = await container().conversation_store.list_turns(
+            session_id, limit=max(1, min(limit, 500)),
+        )
+        return [
+            TurnOut(role=turn.role, content=turn.content, created_at=turn.created_at)
+            for turn in turns
+        ]
+
+    @api.patch("/commerce/sessions/{session_id}", response_model=SessionSummaryOut)
+    async def rename_session(session_id: str, body: RenameSessionRequest) -> SessionSummaryOut:
+        """用户重命名：置 title_custom=True，之后异步语义标题不再覆盖。"""
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="标题不能为空")
+        if not await container().conversation_store.rename_session(session_id, title):
+            raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
+        session = await container().conversation_store.find_session(session_id) or {}
+        return SessionSummaryOut(
+            id=session_id,
+            title=title,
+            created_at=session.get("created_at", ""),
+            last_active_at=session.get("last_active_at", ""),
+        )
+
+    @api.delete("/commerce/sessions/{session_id}")
+    async def delete_session(session_id: str) -> dict:
+        """软删：写 deleted_at，messages/events 仍保留（badcase 数据底座）。"""
+        if not await container().conversation_store.soft_delete_session(session_id):
+            raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
+        return {"session_id": session_id, "deleted": True}
 
     return api
 

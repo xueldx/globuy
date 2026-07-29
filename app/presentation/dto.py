@@ -25,3 +25,24 @@ class SubmitIntentResponse(BaseModel):
 
 class CancelOrderRequest(BaseModel):
     reason: str = Field(min_length=1, description="取消原因")
+
+
+# ---- F3 会话管理 ----
+
+class SessionSummaryOut(BaseModel):
+    """侧边栏列表条目。title 首轮结束前可能为空串。"""
+
+    id: str
+    title: str = ""
+    created_at: str = ""
+    last_active_at: str = ""
+
+
+class RenameSessionRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200, description="会话新标题")
+
+
+class TurnOut(BaseModel):
+    role: str  # buyer / agent
+    content: str
+    created_at: str = ""

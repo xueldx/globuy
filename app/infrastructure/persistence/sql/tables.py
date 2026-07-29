@@ -4,8 +4,12 @@
 持久化范围：对话记录 + 会话状态 + 订单 + 买家偏好。
 商品目录暂不落库，以保持向量建库与评测事实表的一致性。
 
-建表策略：启动时用 `create_all` 幂等建表。生产环境应换成 Alembic 迁移；
-当前 baseline 暂不引入迁移目录。
+建表策略：
+    - 启动路径走 Alembic（`alembic upgrade head`，见 app/composition.py:startup
+      与 alembic/versions/ 下的迁移），旧库据此长出新增列；
+    - 测试路径仍用 `bootstrap_schema` 的 `create_all` 直接按本模型建临时库，
+      不引入迁移历史，避免拖慢 pytest。
+本模型是两边的唯一 schema 权威：Alembic 迁移只记录"相对上一次的变化"。
 
 自增主键用 `BigInteger().with_variant(Integer, "sqlite")`：SQLite 的 AUTOINCREMENT
 只能用于 INTEGER PRIMARY KEY，不做 variant 则单测无法用内存库跑真实 SQL。
@@ -17,6 +21,7 @@ from datetime import datetime
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -50,6 +55,13 @@ class ConversationSessionRow(Base):
     last_active_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now(),
     )
+    # F3 会话标题三段式（兜底截断 → 异步 LLM → title_custom 锁）。
+    # title_custom=True 表示用户手动改过名，语义标题回写只在该列为 False 时命中。
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    title_custom: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="0", default=False,
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ConversationMessageRow(Base):
