@@ -279,8 +279,11 @@ def build_app() -> FastAPI:
             return generation_out(saved)
         await c.conversation_store.touch_session(session_id, body.buyer_id, body.locale, body.currency)
         if c.task_queue is not None:
-            await c.generation_store.transition(generation.generation_id, ("queued",), "failed", error_code="queue_generation_not_supported")
-            raise HTTPException(status_code=503, detail="队列模式的 generation 尚未启用")
+            await _enqueue(c, SubmitIntentInput(
+                shopping_session_id=session_id, buyer_id=body.buyer_id, locale=body.locale,
+                currency=body.currency, raw_query=body.raw_query,
+            ), generation_id=generation.generation_id)
+            return generation_out(generation)
         task = asyncio.create_task(run_generation(c, generation.generation_id, SubmitIntentInput(
             shopping_session_id=session_id, buyer_id=body.buyer_id, locale=body.locale,
             currency=body.currency, raw_query=body.raw_query,
@@ -411,7 +414,13 @@ def build_app() -> FastAPI:
     @api.delete("/commerce/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict:
         """软删：写 deleted_at，messages/events 仍保留（badcase 数据底座）。"""
-        if not await container().conversation_store.soft_delete_session(session_id):
+        c = container()
+        for generation in await c.generation_store.list_active_for_session(session_id):
+            await c.generation_store.request_cancel(generation.generation_id)
+            task = state.get("generation_tasks", {}).get(generation.generation_id)
+            if task is not None:
+                task.cancel()
+        if not await c.conversation_store.soft_delete_session(session_id):
             raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
         return {"session_id": session_id, "deleted": True}
 
@@ -436,18 +445,17 @@ async def _queue_priority(c: Container, session_id: str) -> int:
     return 1 if current >= c.settings.queue_large_request_turns else 0
 
 
-async def _enqueue(c: Container, intent: SubmitIntentInput) -> str:
+async def _enqueue(c: Container, intent: SubmitIntentInput, generation_id: str = "") -> str:
     """入队并做幂等保护。
 
     队列是 at-least-once，且买家/前端可能重复提交。用「会话 + 问句」指纹做幂等键，
     命中说明短时间内已提交过同样内容，直接复用原 task_id，不再入队一次。
     这一步对写操作（下单）尤其关键：重复消费等于重复下单。
     """
-    fingerprint = hashlib.sha256(
-        f"{intent.shopping_session_id}\n{intent.raw_query}".encode(),
-    ).hexdigest()[:32]
+    fingerprint_source = generation_id or f"{intent.shopping_session_id}\n{intent.raw_query}"
+    fingerprint = hashlib.sha256(fingerprint_source.encode()).hexdigest()[:32]
     idem_key = f"idem:{fingerprint}"
-    task_id = f"task-{uuid.uuid4().hex[:12]}"
+    task_id = generation_id or f"task-{uuid.uuid4().hex[:12]}"
 
     acquired = await c.cache.set_if_absent(idem_key, task_id, _IDEMPOTENCY_TTL_SECONDS)
     if not acquired:
@@ -464,6 +472,7 @@ async def _enqueue(c: Container, intent: SubmitIntentInput) -> str:
             locale=intent.locale,
             currency=intent.currency,
             raw_query=intent.raw_query,
+            generation_id=generation_id,
             priority=await _queue_priority(c, intent.shopping_session_id),
         ),
     )

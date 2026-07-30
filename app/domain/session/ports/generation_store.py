@@ -44,6 +44,9 @@ class GenerationStore(ABC):
     async def count_active(self, buyer_id: str) -> int: ...
 
     @abstractmethod
+    async def list_active_for_session(self, session_id: str) -> list[Generation]: ...
+
+    @abstractmethod
     async def transition(self, generation_id: str, from_statuses: tuple[str, ...], to_status: GenerationStatus, *, final_text: str = "", error_code: str = "") -> bool: ...
 
     @abstractmethod

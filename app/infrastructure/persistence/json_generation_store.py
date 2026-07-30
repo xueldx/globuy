@@ -48,6 +48,10 @@ class JsonGenerationStore(GenerationStore):
     async def count_active(self, buyer_id: str) -> int:
         return sum(1 for path in self._dir.glob("*.jsonl") if (item := self._current(path.stem)) and item.buyer_id == buyer_id and item.status in ("queued", "running", "cancelling"))
 
+    async def list_active_for_session(self, session_id: str) -> list[Generation]:
+        items = [self._current(path.stem) for path in self._dir.glob("*.jsonl")]
+        return [item for item in items if item and item.session_id == session_id and item.status in ("queued", "running", "cancelling")]
+
     async def transition(self, generation_id: str, from_statuses: tuple[str, ...], to_status: GenerationStatus, *, final_text: str = "", error_code: str = "") -> bool:
         current = self._current(generation_id)
         if not current or current.status not in from_statuses or current.status in ("completed", "cancelled", "failed"): return False

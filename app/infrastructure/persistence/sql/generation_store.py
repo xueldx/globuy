@@ -42,6 +42,14 @@ class SqlGenerationStore(GenerationStore):
             ))
             return int(count or 0)
 
+    async def list_active_for_session(self, session_id: str) -> list[Generation]:
+        async with self._sessions() as db:
+            rows = (await db.scalars(select(ConversationGenerationRow).where(
+                ConversationGenerationRow.session_id == session_id,
+                ConversationGenerationRow.status.in_(("queued", "running", "cancelling")),
+            ))).all()
+            return [_generation(row) for row in rows]
+
     async def transition(self, generation_id: str, from_statuses: tuple[str, ...], to_status: GenerationStatus, *, final_text: str = "", error_code: str = "") -> bool:
         values = {"status": to_status}
         if to_status in ("completed", "cancelled", "failed"):

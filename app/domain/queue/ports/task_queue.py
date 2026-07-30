@@ -28,6 +28,7 @@ class IntentTask:
     locale: str
     currency: str
     raw_query: str
+    generation_id: str = ""
     enqueued_at: str = field(default_factory=_now_iso)
     # 优先级：0 = 正常请求（1 以上 = 大请求，走低优先队列）。
     # 长会话（轮数多、上下文大）单次耗时明显更长，
@@ -42,6 +43,7 @@ class IntentTask:
             "locale": self.locale,
             "currency": self.currency,
             "raw_query": self.raw_query,
+            "generation_id": self.generation_id,
             "enqueued_at": self.enqueued_at,
             "priority": self.priority,
         }
@@ -55,6 +57,7 @@ class IntentTask:
             locale=raw.get("locale", "zh-CN"),
             currency=raw.get("currency", "CNY"),
             raw_query=raw.get("raw_query", ""),
+            generation_id=raw.get("generation_id", ""),
             enqueued_at=raw.get("enqueued_at", ""),
             priority=int(raw.get("priority", 0)),
         )

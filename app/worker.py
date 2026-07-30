@@ -16,11 +16,13 @@ API 进程负责收请求、入队、等结果；worker 进程负责把队列里
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
 import socket
 import uuid
+from datetime import datetime, timezone
 
 from app.application.agents.orchestrator import SubmitIntentInput
 from app.composition import build_container
@@ -51,10 +53,38 @@ async def main() -> None:
     async def handle(task: IntentTask) -> None:
         nonlocal in_flight
         in_flight += 1
+        if task.generation_id:
+            generation = await container.generation_store.get(task.generation_id)
+            if generation is None:
+                logger.warning("generation 不存在，跳过队列任务：%s", task.generation_id)
+                in_flight -= 1
+                return
+            if generation.status == "cancelling":
+                await container.generation_store.transition(
+                    task.generation_id, ("cancelling",), "cancelled",
+                )
+                in_flight -= 1
+                return
+            await container.generation_store.transition(
+                task.generation_id, ("queued",), "running",
+            )
         await container.task_queue.set_status(TaskStatus(task_id=task.task_id, state="running"))
         container.bus.publish(task.shopping_session_id, "task.started", {"task_id": task.task_id})
+        queue = container.bus.subscribe(task.shopping_session_id) if task.generation_id else None
+
+        async def record_events() -> None:
+            assert queue is not None
+            while True:
+                event = await queue.get()
+                await container.generation_store.append_event(
+                    task.generation_id, event.type, event.payload, event.occurred_at,
+                )
+
+        recorder = asyncio.create_task(record_events()) if queue is not None else None
+        agent_task: asyncio.Task | None = None
+        cancel_watcher: asyncio.Task | None = None
         try:
-            result = await container.orchestrator.handle_intent(
+            agent_task = asyncio.create_task(container.orchestrator.handle_intent(
                 SubmitIntentInput(
                     shopping_session_id=task.shopping_session_id,
                     buyer_id=task.buyer_id,
@@ -62,16 +92,66 @@ async def main() -> None:
                     currency=task.currency,
                     raw_query=task.raw_query,
                 ),
-            )
+            ))
+
+            async def watch_cancel() -> None:
+                while not agent_task.done():
+                    generation = await container.generation_store.get(task.generation_id)
+                    if generation is not None and generation.status == "cancelling":
+                        agent_task.cancel()
+                        return
+                    await asyncio.sleep(0.2)
+
+            if task.generation_id:
+                cancel_watcher = asyncio.create_task(watch_cancel())
+            result = await agent_task
             await container.task_queue.set_status(
                 TaskStatus(task_id=task.task_id, state="done", final_text=result.final_text),
             )
+            if task.generation_id:
+                await container.generation_store.transition(
+                    task.generation_id, ("running",), "completed", final_text=result.final_text,
+                )
+                await container.generation_store.append_event(
+                    task.generation_id, "final.result", {"text": result.final_text},
+                    datetime.now(timezone.utc).isoformat(),
+                )
+        except asyncio.CancelledError:
+            if task.generation_id:
+                await container.generation_store.transition(
+                    task.generation_id, ("queued", "running", "cancelling"), "cancelled",
+                )
+                await container.generation_store.append_event(
+                    task.generation_id, "cancelled", {}, datetime.now(timezone.utc).isoformat(),
+                )
+                await container.task_queue.set_status(
+                    TaskStatus(task_id=task.task_id, state="cancelled"),
+                )
         except Exception as err:  # noqa: BLE001 —— 标记失败后抛出，交给队列决定重投或死信
             await container.task_queue.set_status(
                 TaskStatus(task_id=task.task_id, state="failed", error=str(err)),
             )
+            if task.generation_id:
+                await container.generation_store.transition(
+                    task.generation_id, ("queued", "running", "cancelling"),
+                    "failed", error_code=str(err),
+                )
+                await container.generation_store.append_event(
+                    task.generation_id, "error", {"error": str(err)},
+                    datetime.now(timezone.utc).isoformat(),
+                )
             raise
         finally:
+            if cancel_watcher is not None:
+                cancel_watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cancel_watcher
+            if recorder is not None:
+                recorder.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await recorder
+            if queue is not None:
+                container.bus.unsubscribe(task.shopping_session_id, queue)
             in_flight -= 1
 
     logger.info(
