@@ -47,9 +47,12 @@ export function Component() {
   const handleSend = async () => {
     const query = input.trim();
     if (!query) return;
-    // 被并发上限拒绝时保留输入框内容，避免用户打了半天字一拒就没了
+    // 消息进入发送流程就立刻清空，不能等整条 SSE 结束；否则旧请求结束时还会误清新草稿。
+    const originalInput = input;
+    setInput("");
     const started = await sendMessage(query);
-    if (started) setInput("");
+    // 被并发上限等前置条件拒绝时恢复原输入；用户已键入新草稿则不覆盖。
+    if (!started) setInput((current) => current || originalInput);
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
