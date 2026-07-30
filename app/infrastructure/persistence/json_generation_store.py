@@ -45,9 +45,12 @@ class JsonGenerationStore(GenerationStore):
 
     async def get(self, generation_id: str) -> Optional[Generation]: return self._current(generation_id)
 
+    async def count_active(self, buyer_id: str) -> int:
+        return sum(1 for path in self._dir.glob("*.jsonl") if (item := self._current(path.stem)) and item.buyer_id == buyer_id and item.status in ("queued", "running", "cancelling"))
+
     async def transition(self, generation_id: str, from_statuses: tuple[str, ...], to_status: GenerationStatus, *, final_text: str = "", error_code: str = "") -> bool:
         current = self._current(generation_id)
-        if not current or current.status not in from_statuses: return False
+        if not current or current.status not in from_statuses or current.status in ("completed", "cancelled", "failed"): return False
         self._append(generation_id, {"kind": "generation", **current.__dict__, "status": to_status, "final_text": final_text or current.final_text, "error_code": error_code or current.error_code, "finished_at": datetime.now(timezone.utc).isoformat()})
         return True
 

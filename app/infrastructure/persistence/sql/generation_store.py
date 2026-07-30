@@ -34,6 +34,14 @@ class SqlGenerationStore(GenerationStore):
             row = await db.get(ConversationGenerationRow, generation_id)
             return _generation(row) if row else None
 
+    async def count_active(self, buyer_id: str) -> int:
+        async with self._sessions() as db:
+            count = await db.scalar(select(func.count()).select_from(ConversationGenerationRow).where(
+                ConversationGenerationRow.buyer_id == buyer_id,
+                ConversationGenerationRow.status.in_(("queued", "running", "cancelling")),
+            ))
+            return int(count or 0)
+
     async def transition(self, generation_id: str, from_statuses: tuple[str, ...], to_status: GenerationStatus, *, final_text: str = "", error_code: str = "") -> bool:
         values = {"status": to_status}
         if to_status in ("completed", "cancelled", "failed"):
@@ -43,7 +51,11 @@ class SqlGenerationStore(GenerationStore):
         if error_code:
             values["error_code"] = error_code
         async with self._sessions() as db:
-            result = await db.execute(update(ConversationGenerationRow).where(ConversationGenerationRow.generation_id == generation_id, ConversationGenerationRow.status.in_(from_statuses)).values(**values))
+            result = await db.execute(update(ConversationGenerationRow).where(
+                ConversationGenerationRow.generation_id == generation_id,
+                ConversationGenerationRow.status.in_(from_statuses),
+                ConversationGenerationRow.status.not_in(("completed", "cancelled", "failed")),
+            ).values(**values))
             await db.commit()
             return bool(result.rowcount)
 

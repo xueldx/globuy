@@ -28,6 +28,8 @@ from app.infrastructure.persistence.sql.repositories import (
     bootstrap_schema,
     create_engine,
 )
+from app.domain.session.ports.generation_store import Generation
+from app.infrastructure.persistence.sql.generation_store import SqlGenerationStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -112,6 +114,24 @@ class TestSessionStore:
 
     async def test_missing_returns_none(self, engine):
         assert await SqlSessionStore(engine).load("nope") is None
+
+
+class TestGenerationStore:
+    async def test_idempotency_cancel_and_event_cursor(self, engine):
+        store = SqlGenerationStore(engine)
+        generation = Generation("g1", "s1", "buyer-001", "r1", "queued")
+        saved, created = await store.create_or_get(generation)
+        assert created is True and saved.generation_id == "g1"
+        duplicate, created = await store.create_or_get(Generation("g2", "s1", "buyer-001", "r1", "queued"))
+        assert created is False and duplicate.generation_id == "g1"
+        assert await store.transition("g1", ("queued",), "running") is True
+        first = await store.append_event("g1", "token.delta", {"token": "你"}, "2026-01-01T00:00:00+00:00")
+        second = await store.append_event("g1", "token.delta", {"token": "好"}, "2026-01-01T00:00:01+00:00")
+        assert first and second and [event.seq for event in await store.list_events("g1", 1)] == [2]
+        cancelled = await store.request_cancel("g1")
+        assert cancelled and cancelled.status == "cancelling"
+        assert await store.transition("g1", ("cancelling",), "cancelled") is True
+        assert await store.transition("g1", ("cancelled",), "completed") is False
 
 
 class TestConversationStore:

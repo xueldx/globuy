@@ -268,6 +268,8 @@ def build_app() -> FastAPI:
     async def create_generation(session_id: str, body: CreateGenerationRequest) -> GenerationOut:
         """幂等创建一次运行。SSE 订阅另走 generation 事件端点。"""
         c = container()
+        if await c.generation_store.count_active(body.buyer_id) >= 3:
+            raise HTTPException(status_code=429, detail="generation_limit_reached")
         generation = Generation(
             generation_id=f"gen-{uuid.uuid4().hex}", session_id=session_id,
             buyer_id=body.buyer_id, request_id=body.request_id, status="queued",
