@@ -100,6 +100,18 @@ def build_app() -> FastAPI:
         try:
             result = await c.orchestrator.handle_intent(intent)
             await queue.join()
+            current = await c.generation_store.get(generation_id)
+            if current is not None and current.status in ("cancelling", "cancelled"):
+                # 某些 Agent runtime 会吞掉 task.cancel()，转而返回一条 interruption 文本。
+                # 服务端取消状态优先，不能把该文本当 final.result 覆盖已流出的半截内容。
+                if current.status == "cancelling":
+                    await c.generation_store.append_event(
+                        generation_id, "cancelled", {}, datetime.now(timezone.utc).isoformat(),
+                    )
+                    await c.generation_store.transition(
+                        generation_id, ("cancelling",), "cancelled",
+                    )
+                return
             if result.final_text.startswith("[error]"):
                 await c.generation_store.append_event(
                     generation_id, "error", {"error": result.final_text},

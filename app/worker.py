@@ -109,12 +109,23 @@ async def main() -> None:
             if task.generation_id:
                 cancel_watcher = asyncio.create_task(watch_cancel())
             result = await agent_task
-            await container.task_queue.set_status(
-                TaskStatus(task_id=task.task_id, state="done", final_text=result.final_text),
-            )
             if task.generation_id:
                 assert queue is not None
                 await queue.join()
+                generation = await container.generation_store.get(task.generation_id)
+                if generation is not None and generation.status in ("cancelling", "cancelled"):
+                    if generation.status == "cancelling":
+                        await container.generation_store.append_event(
+                            task.generation_id, "cancelled", {},
+                            datetime.now(timezone.utc).isoformat(),
+                        )
+                        await container.generation_store.transition(
+                            task.generation_id, ("cancelling",), "cancelled",
+                        )
+                    await container.task_queue.set_status(
+                        TaskStatus(task_id=task.task_id, state="cancelled"),
+                    )
+                    return
                 if result.final_text.startswith("[error]"):
                     await container.generation_store.append_event(
                         task.generation_id, "error", {"error": result.final_text},
@@ -134,6 +145,13 @@ async def main() -> None:
                     await container.generation_store.transition(
                         task.generation_id, ("running",), "completed", final_text=result.final_text,
                     )
+                    await container.task_queue.set_status(
+                        TaskStatus(task_id=task.task_id, state="done", final_text=result.final_text),
+                    )
+            else:
+                await container.task_queue.set_status(
+                    TaskStatus(task_id=task.task_id, state="done", final_text=result.final_text),
+                )
         except asyncio.CancelledError:
             if task.generation_id:
                 await container.generation_store.append_event(

@@ -23,6 +23,15 @@ class _FakeOrchestrator:
     async def handle_intent(self, intent) -> SubmitIntentOutput:  # noqa: ANN001
         if intent.raw_query == "block":
             await asyncio.Event().wait()
+        if intent.raw_query == "swallow-cancel":
+            self._bus.publish(intent.shopping_session_id, "token.delta", {"token": "partial"})
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # 模拟 AgentScope 把任务取消转成一条普通最终消息，而不是继续抛 CancelledError。
+                return SubmitIntentOutput(
+                    intent.shopping_session_id, "I notice the interruption. How can I help you?",
+                )
         self._bus.publish(intent.shopping_session_id, "token.delta", {"token": "ok"})
         self._bus.publish(intent.shopping_session_id, "final.result", {"text": "ok"})
         return SubmitIntentOutput(intent.shopping_session_id, "ok")
@@ -64,6 +73,15 @@ def _wait_status(client: TestClient, generation_id: str, expected: str) -> dict:
             return result.json()
         time.sleep(0.01)
     raise AssertionError(f"generation {generation_id} 未进入 {expected}")
+
+
+def _wait_seq(client: TestClient, generation_id: str, minimum: int) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if client.get(f"/commerce/generations/{generation_id}").json()["last_event_seq"] >= minimum:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"generation {generation_id} 未写入 seq {minimum}")
 
 
 def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatch):
@@ -120,6 +138,20 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
         _wait_status(client, cancelled_id, "cancelled")
         cancel_events = client.get(f"/commerce/generations/{cancelled_id}/events").text
         assert cancel_events.count("event: cancelled") == 1
+
+        swallowed = client.post(
+            "/commerce/sessions/s-swallow/generations",
+            json=_payload("req-swallow", "swallow-cancel"),
+        )
+        swallowed_id = swallowed.json()["generation_id"]
+        _wait_seq(client, swallowed_id, 2)
+        client.delete(f"/commerce/generations/{swallowed_id}")
+        _wait_status(client, swallowed_id, "cancelled")
+        swallowed_events = client.get(f"/commerce/generations/{swallowed_id}/events").text
+        assert "partial" in swallowed_events
+        assert "I notice the interruption" not in swallowed_events
+        assert "event: final.result" not in swallowed_events
+        assert swallowed_events.count("event: cancelled") == 1
 
         active_ids: list[str] = []
         for index in range(3):
