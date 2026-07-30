@@ -5,11 +5,12 @@ import {
   DEMO_BUYER_ID,
   deleteSession as apiDeleteSession,
   fetchTurns,
+  fetchLatestGeneration,
   listSessions,
   renameSession as apiRenameSession,
   cancelGeneration,
   createGeneration,
-  subscribeGeneration,
+  subscribeGenerationWithResume,
 } from "@/services/commerce";
 import { useAgentProcessStore } from "./agentProcessStore";
 
@@ -201,6 +202,61 @@ export const useChatStore = create<ChatState>((set, get) => {
         return;
       }
       set({ currentSessionId: sessionId });
+      // 刷新/断网恢复：运行状态在服务端，不从已消失的内存 boolean 猜。
+      // 从 seq=0 回放是安全的，当前页还没有消费记录；generationId+seq 双守卫会去重。
+      try {
+        const generation = await fetchLatestGeneration(sessionId);
+        if (generation.status === "queued" || generation.status === "running" || generation.status === "cancelling") {
+          const settledTurns = await fetchTurns(sessionId);
+          const assistantMsg: ChatMessage = {
+            id: makeId("resume"), role: "assistant", content: "", status: "streaming", createdAt: nowISO(),
+          };
+          set((s) => ({
+            messagesBySession: setKey(
+              s.messagesBySession,
+              sessionId,
+              [...turnsToMessages(sessionId, settledTurns), assistantMsg],
+            ),
+            streamingMsgIdBySession: setKey(s.streamingMsgIdBySession, sessionId, assistantMsg.id),
+            streamingBySession: setKey(s.streamingBySession, sessionId, ""),
+            statusBySession: setKey(s.statusBySession, sessionId, "streaming"),
+          }));
+          const controller = new AbortController();
+          activeStreams.set(sessionId, controller);
+          activeGenerations.set(sessionId, { generationId: generation.generation_id, lastSeq: 0 });
+          void subscribeGenerationWithResume(generation.generation_id, 0, (event, raw) => {
+            const envelope = raw as { generation_id?: string; seq?: number; payload?: unknown };
+            const active = activeGenerations.get(sessionId);
+            if (!active || active.generationId !== envelope.generation_id || (envelope.seq ?? 0) <= active.lastSeq) return;
+            active.lastSeq = envelope.seq ?? active.lastSeq;
+            if (get().streamingMsgIdBySession[sessionId] !== assistantMsg.id) return;
+            const payload = envelope.payload as { token?: string; text?: string; error?: string; message?: string };
+            if (event === "token.delta") {
+              set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, (s.streamingBySession[sessionId] ?? "") + (payload.token ?? "")) }));
+            } else if (event === "final.result") {
+              if (payload.text) set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, payload.text!) }));
+              finalizeStream(sessionId, assistantMsg.id, "done");
+            } else if (event === "cancelled") {
+              finalizeStream(sessionId, assistantMsg.id, "cancelled");
+            } else if (event === "error") {
+              const text = payload.error ?? payload.message;
+              if (text) set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, text) }));
+              finalizeStream(sessionId, assistantMsg.id, "error");
+            }
+          }, controller.signal).catch((err) => {
+            if (!controller.signal.aborted && get().streamingMsgIdBySession[sessionId] === assistantMsg.id) {
+              set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, `[interrupted] ${(err as Error).message}`) }));
+              finalizeStream(sessionId, assistantMsg.id, "error");
+            }
+          }).finally(() => {
+            if (activeStreams.get(sessionId) === controller) activeStreams.delete(sessionId);
+            activeGenerations.delete(sessionId);
+          });
+          return;
+        }
+      } catch {
+        // 404 表示没有活跃 generation，继续走已定型历史加载。
+      }
       // ③ 历史已缓存 → 直接渲染本地
       if ((state.messagesBySession[sessionId]?.length ?? 0) > 0) return;
       // 拉取中 → 不重复发请求
@@ -321,7 +377,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             raw_query: query,
         });
         activeGenerations.set(sid, { generationId: generation.generation_id, lastSeq: 0 });
-        await subscribeGeneration(
+        await subscribeGenerationWithResume(
           generation.generation_id,
           0,
           (event, raw) => {
@@ -353,6 +409,10 @@ export const useChatStore = create<ChatState>((set, get) => {
                     }));
                   }
                   finalize("done");
+                  break;
+                }
+                case "cancelled": {
+                  finalize("cancelled");
                   break;
                 }
                 case "error": {
@@ -410,7 +470,14 @@ export const useChatStore = create<ChatState>((set, get) => {
       const sid = sessionId ?? get().currentSessionId;
       if (!sid) return;
       const generation = activeGenerations.get(sid);
-      if (generation) void cancelGeneration(generation.generationId).finally(() => activeStreams.get(sid)?.abort());
+      if (generation) {
+        // 保留订阅直到收到 cancelled 终态，避免把“服务端已接受取消”误显示成“任务已停止”。
+        void cancelGeneration(generation.generationId).catch((err) => {
+          flashNotice(set, `取消失败：${(err as Error).message}`);
+        });
+      } else {
+        activeStreams.get(sid)?.abort();
+      }
     },
 
     renameSession: async (sessionId, title) => {

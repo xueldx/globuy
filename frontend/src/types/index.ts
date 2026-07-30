@@ -12,6 +12,7 @@ export type TradeEventType =
   | "task.queued"
   | "task.started"
   | "final.result"
+  | "cancelled"
   | "error";
 
 export interface TradeEvent {

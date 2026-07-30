@@ -109,20 +109,20 @@ async def main() -> None:
                 TaskStatus(task_id=task.task_id, state="done", final_text=result.final_text),
             )
             if task.generation_id:
-                await container.generation_store.transition(
-                    task.generation_id, ("running",), "completed", final_text=result.final_text,
-                )
                 await container.generation_store.append_event(
                     task.generation_id, "final.result", {"text": result.final_text},
                     datetime.now(timezone.utc).isoformat(),
                 )
+                await container.generation_store.transition(
+                    task.generation_id, ("running",), "completed", final_text=result.final_text,
+                )
         except asyncio.CancelledError:
             if task.generation_id:
-                await container.generation_store.transition(
-                    task.generation_id, ("queued", "running", "cancelling"), "cancelled",
-                )
                 await container.generation_store.append_event(
                     task.generation_id, "cancelled", {}, datetime.now(timezone.utc).isoformat(),
+                )
+                await container.generation_store.transition(
+                    task.generation_id, ("queued", "running", "cancelling"), "cancelled",
                 )
                 await container.task_queue.set_status(
                     TaskStatus(task_id=task.task_id, state="cancelled"),
@@ -132,13 +132,13 @@ async def main() -> None:
                 TaskStatus(task_id=task.task_id, state="failed", error=str(err)),
             )
             if task.generation_id:
-                await container.generation_store.transition(
-                    task.generation_id, ("queued", "running", "cancelling"),
-                    "failed", error_code=str(err),
-                )
                 await container.generation_store.append_event(
                     task.generation_id, "error", {"error": str(err)},
                     datetime.now(timezone.utc).isoformat(),
+                )
+                await container.generation_store.transition(
+                    task.generation_id, ("queued", "running", "cancelling"),
+                    "failed", error_code=str(err),
                 )
             raise
         finally:

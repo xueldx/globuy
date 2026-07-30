@@ -94,27 +94,27 @@ def build_app() -> FastAPI:
         recorder = asyncio.create_task(persist_events())
         try:
             result = await c.orchestrator.handle_intent(intent)
-            await c.generation_store.transition(
-                generation_id, ("running",), "completed", final_text=result.final_text,
-            )
             await c.generation_store.append_event(
                 generation_id, "final.result", {"text": result.final_text},
                 datetime.now(timezone.utc).isoformat(),
             )
-        except asyncio.CancelledError:
             await c.generation_store.transition(
-                generation_id, ("queued", "running", "cancelling"), "cancelled",
+                generation_id, ("running",), "completed", final_text=result.final_text,
             )
+        except asyncio.CancelledError:
             await c.generation_store.append_event(
                 generation_id, "cancelled", {}, datetime.now(timezone.utc).isoformat(),
             )
+            await c.generation_store.transition(
+                generation_id, ("queued", "running", "cancelling"), "cancelled",
+            )
             raise
         except Exception as err:  # noqa: BLE001
-            await c.generation_store.transition(
-                generation_id, ("queued", "running", "cancelling"), "failed", error_code=str(err),
-            )
             await c.generation_store.append_event(
                 generation_id, "error", {"error": str(err)}, datetime.now(timezone.utc).isoformat(),
+            )
+            await c.generation_store.transition(
+                generation_id, ("queued", "running", "cancelling"), "failed", error_code=str(err),
             )
         finally:
             recorder.cancel()
@@ -297,6 +297,14 @@ def build_app() -> FastAPI:
         if generation is None:
             raise HTTPException(status_code=404, detail="generation 不存在")
         return generation_out(generation)
+
+    @api.get("/commerce/sessions/{session_id}/generations/latest", response_model=GenerationOut)
+    async def latest_active_generation(session_id: str) -> GenerationOut:
+        """刷新恢复入口：只返回该会话仍未终态的一次运行。"""
+        active = await container().generation_store.list_active_for_session(session_id)
+        if not active:
+            raise HTTPException(status_code=404, detail="没有活跃 generation")
+        return generation_out(active[-1])
 
     @api.delete("/commerce/generations/{generation_id}", response_model=GenerationOut)
     async def cancel_generation(generation_id: str) -> GenerationOut:

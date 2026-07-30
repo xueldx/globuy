@@ -47,8 +47,46 @@ export function subscribeGeneration(generationId: string, afterSeq: number, onEv
   return subscribeSSE(`/commerce/generations/${encodeURIComponent(generationId)}/events?after_seq=${afterSeq}`, onEvent, signal);
 }
 
+/** generation 已在服务端存在，重连 GET SSE 不会重复启动 Agent，因此可安全按 seq 重试。 */
+export async function subscribeGenerationWithResume(
+  generationId: string,
+  initialSeq: number,
+  onEvent: (event: string, payload: unknown) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  let cursor = initialSeq;
+  let attempt = 0;
+  while (!signal?.aborted) {
+    try {
+      await subscribeGeneration(generationId, cursor, (event, raw) => {
+        const envelope = raw as { seq?: number };
+        cursor = Math.max(cursor, envelope.seq ?? cursor);
+        onEvent(event, raw);
+      }, signal);
+      return;
+    } catch (err) {
+      if (signal?.aborted || attempt >= 6) throw err;
+      const delay = Math.min(5000, 400 * 2 ** attempt);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, delay);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new DOMException("Aborted", "AbortError"));
+        }, { once: true });
+      });
+      attempt += 1;
+    }
+  }
+}
+
 export function cancelGeneration(generationId: string) {
   return request<GenerationSummary>(`/commerce/generations/${encodeURIComponent(generationId)}`, { method: "DELETE" });
+}
+
+export function fetchLatestGeneration(sessionId: string) {
+  return request<GenerationSummary>(
+    `/commerce/sessions/${encodeURIComponent(sessionId)}/generations/latest`,
+  );
 }
 
 // ===== F3 会话管理（服务端为真相源：列表 / 历史 / 重命名 / 软删）=====
