@@ -88,19 +88,34 @@ def build_app() -> FastAPI:
         async def persist_events() -> None:
             while True:
                 event = await queue.get()
-                await c.generation_store.append_event(
-                    generation_id, event.type, event.payload, event.occurred_at,
-                )
+                try:
+                    # generation 的终态只由本执行器落一次，避免总线事件与显式收尾重复。
+                    if event.type not in ("final.result", "error", "cancelled"):
+                        await c.generation_store.append_event(
+                            generation_id, event.type, event.payload, event.occurred_at,
+                        )
+                finally:
+                    queue.task_done()
         recorder = asyncio.create_task(persist_events())
         try:
             result = await c.orchestrator.handle_intent(intent)
-            await c.generation_store.append_event(
-                generation_id, "final.result", {"text": result.final_text},
-                datetime.now(timezone.utc).isoformat(),
-            )
-            await c.generation_store.transition(
-                generation_id, ("running",), "completed", final_text=result.final_text,
-            )
+            await queue.join()
+            if result.final_text.startswith("[error]"):
+                await c.generation_store.append_event(
+                    generation_id, "error", {"error": result.final_text},
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                await c.generation_store.transition(
+                    generation_id, ("running",), "failed", error_code="agent_error",
+                )
+            else:
+                await c.generation_store.append_event(
+                    generation_id, "final.result", {"text": result.final_text},
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                await c.generation_store.transition(
+                    generation_id, ("running",), "completed", final_text=result.final_text,
+                )
         except asyncio.CancelledError:
             await c.generation_store.append_event(
                 generation_id, "cancelled", {}, datetime.now(timezone.utc).isoformat(),
@@ -268,15 +283,21 @@ def build_app() -> FastAPI:
     async def create_generation(session_id: str, body: CreateGenerationRequest) -> GenerationOut:
         """幂等创建一次运行。SSE 订阅另走 generation 事件端点。"""
         c = container()
-        if await c.generation_store.count_active(body.buyer_id) >= 3:
-            raise HTTPException(status_code=429, detail="generation_limit_reached")
-        generation = Generation(
-            generation_id=f"gen-{uuid.uuid4().hex}", session_id=session_id,
-            buyer_id=body.buyer_id, request_id=body.request_id, status="queued",
-        )
-        saved, created = await c.generation_store.create_or_get(generation)
-        if not created:
-            return generation_out(saved)
+        # 同一 API 进程内串行完成“幂等创建 + 配额判断”，避免重复请求被 429 拒绝。
+        async with state.setdefault("generation_create_lock", asyncio.Lock()):
+            generation = Generation(
+                generation_id=f"gen-{uuid.uuid4().hex}", session_id=session_id,
+                buyer_id=body.buyer_id, request_id=body.request_id, status="queued",
+            )
+            saved, created = await c.generation_store.create_or_get(generation)
+            if not created:
+                return generation_out(saved)
+            if await c.generation_store.count_active(body.buyer_id) > 3:
+                await c.generation_store.transition(
+                    generation.generation_id, ("queued",), "failed",
+                    error_code="generation_limit_reached",
+                )
+                raise HTTPException(status_code=429, detail="generation_limit_reached")
         await c.conversation_store.touch_session(session_id, body.buyer_id, body.locale, body.currency)
         if c.task_queue is not None:
             await _enqueue(c, SubmitIntentInput(
@@ -324,15 +345,22 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="generation 不存在")
         async def stream() -> AsyncGenerator[str, None]:
             cursor = max(0, after_seq)
+            idle_polls = 0
             while True:
                 events = await c.generation_store.list_events(generation_id, cursor)
                 for item in events:
                     cursor = item.seq
                     payload = json.dumps({"generation_id": generation_id, "seq": item.seq, "payload": item.payload}, ensure_ascii=False)
                     yield f"event: {item.type}\ndata: {payload}\n\n"
+                if events:
+                    idle_polls = 0
                 generation = await c.generation_store.get(generation_id)
                 if generation is None or generation.status in ("completed", "cancelled", "failed"):
                     return
+                idle_polls += 1
+                if idle_polls >= 50:
+                    yield ": keepalive\n\n"
+                    idle_polls = 0
                 await asyncio.sleep(0.2)
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 

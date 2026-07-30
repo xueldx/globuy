@@ -15,21 +15,18 @@ import {
 import { useAgentProcessStore } from "./agentProcessStore";
 
 /**
- * F3 会话状态机（分片 + 后台持流 + 服务端真相源）
+ * F3.1 会话状态机（分片 + generation 可恢复订阅 + 服务端真相源）
  *
- * 设计要点（详见 AICoding/02-会话状态机/决策.md D1–D12）：
+ * 设计要点（详见 AICoding/02-会话状态机/决策.md）：
  *
  * 1. 分片：一切按 sessionId 归位。messages/流式文本/守卫消息 id/状态都是
  *    `...BySession` 记录，切会话不可能串消息——token 永远写进自己的分片。
- * 2. 后台持流：activeStreams 是模块级 Map（不进 zustand，selector 不会因此空转）。
- *    切换会话**不 abort**：Agent 任务不随前端连接死，事件无人订阅即丢弃，
- *    所以切走的会话只是没有组件订阅它，流照常收、照常写分片；谁订阅谁看到。
+ * 2. generation 与订阅分离：Agent 任务由服务端 generation 承载，SSE 断开可按 seq 重连，
+ *    浏览器连接不再决定任务生命周期。activeStreams 只控制本页订阅，不进 zustand。
  * 3. 派生 isStreaming：statusBySession[sid] === "streaming" ⇔ 该会话在流。
  *    不做独立的 isStreaming 布尔，消灭「一个真一个假」的失同步。
- * 4. 并发上限：HTTP/1.1 同域 6 连接，3 条流已经占掉一半，超限**明确拒绝**，
- *    不排队（排队会像页面卡死）。列表/历史/PATCH/DELETE 永远有额度。
- * 5. 竞态三件套全部 per-session：幂等守卫（挡 StrictMode 双挂载）、await 之后
- *    回查 currentSessionId、finally 再回查才重置标志。
+ * 4. 并发上限：前端提前提示，服务端按 buyer_id 兜底；前端限制不是安全边界。
+ * 5. 竞态守卫：generationId 隔离运行，seq 去重回放，messageId 锁定 UI 写入目标。
  */
 export interface ChatState {
   /** 会话列表（服务端为真相源，本状态只是缓存） */
@@ -52,17 +49,17 @@ export interface ChatState {
   selectSession: (sessionId: string) => Promise<void>;
   /** 对当前会话发送意图并启动 SSE 流；被并发上限拒绝时返回 false */
   sendMessage: (rawQuery: string) => Promise<boolean>;
-  /** 停止指定会话（默认当前）的生成：abort 让 sendMessage 的 catch 走 cancelled 收口 */
+  /** 停止指定会话（默认当前）的生成：请求服务端取消，收到 cancelled 后再收口 UI */
   stopStream: (sessionId?: string) => void;
   /** 乐观重命名，失败回滚并返回 false */
   renameSession: (sessionId: string, title: string) => Promise<boolean>;
   /** 删除：先掐流 → 乐观移除列表 → DELETE。服务端确认（含 404 幂等）才清分片并返回 true；
-   *  失败回滚列表返回 false。已断的流不复活（abort 的轮已在 catch 收口为 cancelled）。 */
+   *  失败回滚列表返回 false。后端删除接口会先持久化取消请求，再执行软删。 */
   deleteSession: (sessionId: string) => Promise<boolean>;
   dismissNotice: () => void;
 }
 
-/** 并发流上限（决策 D10：明确拒绝不排队） */
+/** 并发 generation 上限：前端提前提示，服务端仍会独立校验。 */
 export const MAX_CONCURRENT_STREAMS = 3;
 
 /**
@@ -519,7 +516,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       const wasCurrent = get().currentSessionId === sessionId;
       const previousSessions = get().sessions;
 
-      // ① 先掐流（abort 不可逆：先掐防僵尸写入；失败也不复活——该轮已在 abort 的 catch 收口为 cancelled）
+      // ① 先关闭本页订阅，避免已删除会话继续更新 UI；后端 DELETE 会取消该会话的活跃 generation。
       const controller = activeStreams.get(sessionId);
       if (controller) {
         controller.abort();

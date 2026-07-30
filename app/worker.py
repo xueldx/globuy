@@ -76,9 +76,13 @@ async def main() -> None:
             assert queue is not None
             while True:
                 event = await queue.get()
-                await container.generation_store.append_event(
-                    task.generation_id, event.type, event.payload, event.occurred_at,
-                )
+                try:
+                    if event.type not in ("final.result", "error", "cancelled"):
+                        await container.generation_store.append_event(
+                            task.generation_id, event.type, event.payload, event.occurred_at,
+                        )
+                finally:
+                    queue.task_done()
 
         recorder = asyncio.create_task(record_events()) if queue is not None else None
         agent_task: asyncio.Task | None = None
@@ -109,13 +113,27 @@ async def main() -> None:
                 TaskStatus(task_id=task.task_id, state="done", final_text=result.final_text),
             )
             if task.generation_id:
-                await container.generation_store.append_event(
-                    task.generation_id, "final.result", {"text": result.final_text},
-                    datetime.now(timezone.utc).isoformat(),
-                )
-                await container.generation_store.transition(
-                    task.generation_id, ("running",), "completed", final_text=result.final_text,
-                )
+                assert queue is not None
+                await queue.join()
+                if result.final_text.startswith("[error]"):
+                    await container.generation_store.append_event(
+                        task.generation_id, "error", {"error": result.final_text},
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    await container.generation_store.transition(
+                        task.generation_id, ("running",), "failed", error_code="agent_error",
+                    )
+                    await container.task_queue.set_status(
+                        TaskStatus(task_id=task.task_id, state="failed", error=result.final_text),
+                    )
+                else:
+                    await container.generation_store.append_event(
+                        task.generation_id, "final.result", {"text": result.final_text},
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    await container.generation_store.transition(
+                        task.generation_id, ("running",), "completed", final_text=result.final_text,
+                    )
         except asyncio.CancelledError:
             if task.generation_id:
                 await container.generation_store.append_event(

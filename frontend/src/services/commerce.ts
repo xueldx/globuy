@@ -2,7 +2,7 @@ import { API_BASE, request } from "@/lib/api";
 import { postSSE, subscribeSSE } from "@/lib/stream";
 import type { GenerationSummary, SessionSummary, SessionTurn } from "@/types";
 
-/** 意图提交协议（POST /commerce/intents）。F2/F3 接入，F8 补幂等。 */
+/** 意图提交协议。旧同步接口仍使用它，generation 创建会额外携带 request_id。 */
 export interface IntentPayload {
   shopping_session_id: string;
   buyer_id: string;
@@ -22,7 +22,7 @@ export function postIntent(payload: IntentPayload) {
   return request<unknown>("/commerce/intents", { method: "POST", body: payload });
 }
 
-/** SSE 流式意图提交（POST /commerce/stream，F2 主链路）。onEvent 按 event 名分流。 */
+/** 旧版 POST SSE 兼容入口；F3.1 前端主链路已改为 createGeneration + GET 订阅。 */
 export function streamIntent(
   payload: IntentPayload,
   handlers: { onEvent: (event: string, payload: unknown) => void; onError?: (error: Error) => void },
