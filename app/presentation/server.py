@@ -32,6 +32,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from typing import AsyncGenerator, Optional
@@ -96,14 +97,24 @@ def build_app() -> FastAPI:
             await c.generation_store.transition(
                 generation_id, ("running",), "completed", final_text=result.final_text,
             )
+            await c.generation_store.append_event(
+                generation_id, "final.result", {"text": result.final_text},
+                datetime.now(timezone.utc).isoformat(),
+            )
         except asyncio.CancelledError:
             await c.generation_store.transition(
                 generation_id, ("queued", "running", "cancelling"), "cancelled",
+            )
+            await c.generation_store.append_event(
+                generation_id, "cancelled", {}, datetime.now(timezone.utc).isoformat(),
             )
             raise
         except Exception as err:  # noqa: BLE001
             await c.generation_store.transition(
                 generation_id, ("queued", "running", "cancelling"), "failed", error_code=str(err),
+            )
+            await c.generation_store.append_event(
+                generation_id, "error", {"error": str(err)}, datetime.now(timezone.utc).isoformat(),
             )
         finally:
             recorder.cancel()

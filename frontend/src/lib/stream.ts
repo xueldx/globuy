@@ -125,3 +125,16 @@ export async function postSSE(options: PostSSEOptions): Promise<void> {
   // 阶段二：流一旦开始，绝不再发第二次
   await readSseStream(response, options.onEvent);
 }
+
+/** 订阅已创建的 generation。abort 只关闭这条观看连接，不会取消服务端任务。 */
+export async function subscribeSSE(
+  url: string,
+  onEvent: PostSSEOptions["onEvent"],
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(`${API_BASE}${url}`, {
+    headers: { Accept: "text/event-stream" }, signal,
+  });
+  if (!response.ok) throw new Error(`SSE 订阅失败（${response.status}）`);
+  await readSseStream(response, onEvent);
+}

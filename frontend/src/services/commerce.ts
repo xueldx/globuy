@@ -1,6 +1,6 @@
 import { API_BASE, request } from "@/lib/api";
-import { postSSE } from "@/lib/stream";
-import type { SessionSummary, SessionTurn } from "@/types";
+import { postSSE, subscribeSSE } from "@/lib/stream";
+import type { GenerationSummary, SessionSummary, SessionTurn } from "@/types";
 
 /** 意图提交协议（POST /commerce/intents）。F2/F3 接入，F8 补幂等。 */
 export interface IntentPayload {
@@ -35,6 +35,20 @@ export function streamIntent(
     onEvent: handlers.onEvent,
     onError: handlers.onError,
   });
+}
+
+export function createGeneration(sessionId: string, payload: Omit<IntentPayload, "shopping_session_id"> & { request_id: string }) {
+  return request<GenerationSummary>(`/commerce/sessions/${encodeURIComponent(sessionId)}/generations`, {
+    method: "POST", body: payload,
+  });
+}
+
+export function subscribeGeneration(generationId: string, afterSeq: number, onEvent: (event: string, payload: unknown) => void, signal?: AbortSignal) {
+  return subscribeSSE(`/commerce/generations/${encodeURIComponent(generationId)}/events?after_seq=${afterSeq}`, onEvent, signal);
+}
+
+export function cancelGeneration(generationId: string) {
+  return request<GenerationSummary>(`/commerce/generations/${encodeURIComponent(generationId)}`, { method: "DELETE" });
 }
 
 // ===== F3 会话管理（服务端为真相源：列表 / 历史 / 重命名 / 软删）=====

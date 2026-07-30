@@ -7,7 +7,9 @@ import {
   fetchTurns,
   listSessions,
   renameSession as apiRenameSession,
-  streamIntent,
+  cancelGeneration,
+  createGeneration,
+  subscribeGeneration,
 } from "@/services/commerce";
 import { useAgentProcessStore } from "./agentProcessStore";
 
@@ -109,6 +111,7 @@ function delKey<T>(map: Record<string, T>, key: string): Record<string, T> {
  * devtools 可观测、HMR 安全——Map 生命周期与 store 解耦，页面关掉任务自然结束。
  */
 const activeStreams = new Map<string, AbortController>();
+const activeGenerations = new Map<string, { generationId: string; lastSeq: number }>();
 
 // 一次性提示的自动熄灭定时器
 let noticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -310,16 +313,23 @@ export const useChatStore = create<ChatState>((set, get) => {
       };
 
       try {
-        await streamIntent(
-          {
-            shopping_session_id: sid,
+        const generation = await createGeneration(sid, {
+            request_id: makeId("req"),
             buyer_id: DEMO_BUYER_ID,
             locale: "zh-CN",
             currency: "CNY",
             raw_query: query,
-          },
-          {
-            onEvent: (event, payload) => {
+        });
+        activeGenerations.set(sid, { generationId: generation.generation_id, lastSeq: 0 });
+        await subscribeGeneration(
+          generation.generation_id,
+          0,
+          (event, raw) => {
+              const envelope = raw as { generation_id?: string; seq?: number; payload?: unknown };
+              const active = activeGenerations.get(sid);
+              if (!active || active.generationId !== envelope.generation_id || (envelope.seq ?? 0) <= active.lastSeq) return;
+              active.lastSeq = envelope.seq ?? active.lastSeq;
+              const payload = envelope.payload;
               if (!isActive()) return;
               switch (event) {
                 case "token.delta": {
@@ -373,14 +383,6 @@ export const useChatStore = create<ChatState>((set, get) => {
                     });
                   }
               }
-            },
-            onError: (err) => {
-              // 重试耗尽等真实错误；主动 abort 走 catch，不在此处理
-              if (!isActive() || controller.signal.aborted) return;
-              const text = get().streamingBySession[sid] || `[error] ${err.message}`;
-              set((s) => ({ streamingBySession: setKey(s.streamingBySession, sid, text) }));
-              finalize("error");
-            },
           },
           controller.signal,
         );
@@ -399,6 +401,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       } finally {
         // 只删自己这个 controller：不误伤同会话新起的流（本版本同会话同一时刻仅一条）
         if (activeStreams.get(sid) === controller) activeStreams.delete(sid);
+        activeGenerations.delete(sid);
       }
       return true;
     },
@@ -406,8 +409,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     stopStream: (sessionId) => {
       const sid = sessionId ?? get().currentSessionId;
       if (!sid) return;
-      // 只 abort 不断任何状态：sendMessage 的 catch 会以 cancelled 收口并清掉流式标志
-      activeStreams.get(sid)?.abort();
+      const generation = activeGenerations.get(sid);
+      if (generation) void cancelGeneration(generation.generationId).finally(() => activeStreams.get(sid)?.abort());
     },
 
     renameSession: async (sessionId, title) => {

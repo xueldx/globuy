@@ -75,3 +75,12 @@ export interface SessionTurn {
   content: string;
   created_at: string;
 }
+
+export interface GenerationSummary {
+  generation_id: string;
+  session_id: string;
+  status: "queued" | "running" | "cancelling" | "completed" | "cancelled" | "failed";
+  last_event_seq: number;
+  final_text: string;
+  error_code: string;
+}
