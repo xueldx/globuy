@@ -46,3 +46,18 @@ class TurnOut(BaseModel):
     role: str  # buyer / agent
     content: str
     created_at: str = ""
+
+
+# ---- F3.1 generation 生命周期 ----
+
+class CreateGenerationRequest(SubmitIntentRequest):
+    request_id: str = Field(min_length=1, max_length=64)
+
+
+class GenerationOut(BaseModel):
+    generation_id: str
+    session_id: str
+    status: str
+    last_event_seq: int = 0
+    final_text: str = ""
+    error_code: str = ""

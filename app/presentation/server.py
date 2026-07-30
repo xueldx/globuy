@@ -52,7 +52,10 @@ from app.presentation.dto import (
     SubmitIntentRequest,
     SubmitIntentResponse,
     TurnOut,
+    CreateGenerationRequest,
+    GenerationOut,
 )
+from app.domain.session.ports.generation_store import Generation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -66,6 +69,48 @@ _TURN_COUNTER_TTL_SECONDS = 86400
 
 def build_app() -> FastAPI:
     state: dict = {}
+
+    def generation_out(generation) -> GenerationOut:  # noqa: ANN001
+        return GenerationOut(
+            generation_id=generation.generation_id,
+            session_id=generation.session_id,
+            status=generation.status,
+            last_event_seq=generation.last_event_seq,
+            final_text=generation.final_text,
+            error_code=generation.error_code,
+        )
+
+    async def run_generation(c: Container, generation_id: str, intent: SubmitIntentInput) -> None:
+        """执行与事件持久化分离，浏览器断开不影响任务。"""
+        await c.generation_store.transition(generation_id, ("queued",), "running")
+        queue = c.bus.subscribe(intent.shopping_session_id)
+        async def persist_events() -> None:
+            while True:
+                event = await queue.get()
+                await c.generation_store.append_event(
+                    generation_id, event.type, event.payload, event.occurred_at,
+                )
+        recorder = asyncio.create_task(persist_events())
+        try:
+            result = await c.orchestrator.handle_intent(intent)
+            await c.generation_store.transition(
+                generation_id, ("running",), "completed", final_text=result.final_text,
+            )
+        except asyncio.CancelledError:
+            await c.generation_store.transition(
+                generation_id, ("queued", "running", "cancelling"), "cancelled",
+            )
+            raise
+        except Exception as err:  # noqa: BLE001
+            await c.generation_store.transition(
+                generation_id, ("queued", "running", "cancelling"), "failed", error_code=str(err),
+            )
+        finally:
+            recorder.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await recorder
+            c.bus.unsubscribe(intent.shopping_session_id, queue)
+            state.get("generation_tasks", {}).pop(generation_id, None)
 
     async def _forward_remote_events(c: Container) -> None:
         """把其他进程（worker）广播的事件转发给本进程的 WS 订阅者。"""
@@ -207,6 +252,65 @@ def build_app() -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
+
+    @api.post("/commerce/sessions/{session_id}/generations", response_model=GenerationOut)
+    async def create_generation(session_id: str, body: CreateGenerationRequest) -> GenerationOut:
+        """幂等创建一次运行。SSE 订阅另走 generation 事件端点。"""
+        c = container()
+        generation = Generation(
+            generation_id=f"gen-{uuid.uuid4().hex}", session_id=session_id,
+            buyer_id=body.buyer_id, request_id=body.request_id, status="queued",
+        )
+        saved, created = await c.generation_store.create_or_get(generation)
+        if not created:
+            return generation_out(saved)
+        await c.conversation_store.touch_session(session_id, body.buyer_id, body.locale, body.currency)
+        if c.task_queue is not None:
+            await c.generation_store.transition(generation.generation_id, ("queued",), "failed", error_code="queue_generation_not_supported")
+            raise HTTPException(status_code=503, detail="队列模式的 generation 尚未启用")
+        task = asyncio.create_task(run_generation(c, generation.generation_id, SubmitIntentInput(
+            shopping_session_id=session_id, buyer_id=body.buyer_id, locale=body.locale,
+            currency=body.currency, raw_query=body.raw_query,
+        )))
+        state.setdefault("generation_tasks", {})[generation.generation_id] = task
+        return generation_out(generation)
+
+    @api.get("/commerce/generations/{generation_id}", response_model=GenerationOut)
+    async def get_generation(generation_id: str) -> GenerationOut:
+        generation = await container().generation_store.get(generation_id)
+        if generation is None:
+            raise HTTPException(status_code=404, detail="generation 不存在")
+        return generation_out(generation)
+
+    @api.delete("/commerce/generations/{generation_id}", response_model=GenerationOut)
+    async def cancel_generation(generation_id: str) -> GenerationOut:
+        c = container()
+        generation = await c.generation_store.request_cancel(generation_id)
+        if generation is None:
+            raise HTTPException(status_code=404, detail="generation 不存在")
+        task = state.get("generation_tasks", {}).get(generation_id)
+        if task is not None:
+            task.cancel()
+        return generation_out(generation)
+
+    @api.get("/commerce/generations/{generation_id}/events")
+    async def generation_events(generation_id: str, after_seq: int = 0) -> StreamingResponse:
+        c = container()
+        if await c.generation_store.get(generation_id) is None:
+            raise HTTPException(status_code=404, detail="generation 不存在")
+        async def stream() -> AsyncGenerator[str, None]:
+            cursor = max(0, after_seq)
+            while True:
+                events = await c.generation_store.list_events(generation_id, cursor)
+                for item in events:
+                    cursor = item.seq
+                    payload = json.dumps({"generation_id": generation_id, "seq": item.seq, "payload": item.payload}, ensure_ascii=False)
+                    yield f"event: {item.type}\ndata: {payload}\n\n"
+                generation = await c.generation_store.get(generation_id)
+                if generation is None or generation.status in ("completed", "cancelled", "failed"):
+                    return
+                await asyncio.sleep(0.2)
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
     @api.get("/commerce/tasks/{task_id}")
     async def get_task(task_id: str) -> dict:

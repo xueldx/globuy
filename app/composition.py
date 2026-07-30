@@ -34,6 +34,7 @@ from app.application.usecases.order_usecases import (
 )
 from app.domain.queue.ports.task_queue import TaskQueue
 from app.domain.session.ports.conversation_store import ConversationStore
+from app.domain.session.ports.generation_store import GenerationStore
 from app.infrastructure.cache.cached_embedding_client import CachedEmbeddingClient
 from app.infrastructure.cache.redis_cache import RedisCache
 from app.infrastructure.cache.semantic_cache import SemanticCache
@@ -49,6 +50,8 @@ from app.infrastructure.persistence.json_file_stores import (
     JsonFilePreferenceStore,
     JsonFileSessionStore,
 )
+from app.infrastructure.persistence.json_generation_store import JsonGenerationStore
+from app.infrastructure.persistence.sql.generation_store import SqlGenerationStore
 from app.infrastructure.persistence.sql.repositories import (
     SqlConversationStore,
     SqlOrderRepository,
@@ -96,6 +99,7 @@ class Container:
     bus: TradeEventBus
     orchestrator: MainAgentOrchestrator
     conversation_store: ConversationStore
+    generation_store: GenerationStore
     cache: RedisCache
     semantic_cache: SemanticCache
     task_queue: Optional[TaskQueue]
@@ -188,12 +192,14 @@ async def build_container() -> Container:
         preference_store = SqlPreferenceStore(db_engine)
         session_store = SqlSessionStore(db_engine)
         conversation_store = SqlConversationStore(db_engine)
+        generation_store = SqlGenerationStore(db_engine)
         logger.info("持久化形态：%s", db_engine.url.get_backend_name())
     else:
         order_repo = InMemoryOrderRepository()
         preference_store = JsonFilePreferenceStore(settings.data_dir)
         session_store = JsonFileSessionStore(settings.data_dir)
         conversation_store = JsonFileConversationStore(settings.data_dir)
+        generation_store = JsonGenerationStore(settings.data_dir)
         logger.info("持久化形态：本地 JSON 文件（DATABASE_URL=file）")
 
     # 熔断注册表：开 BREAKER_SHARED 且 Redis 可用时跨实例共享，否则进程内
@@ -267,6 +273,7 @@ async def build_container() -> Container:
         bus=bus,
         orchestrator=orchestrator,
         conversation_store=conversation_store,
+        generation_store=generation_store,
         cache=cache,
         semantic_cache=semantic_cache,
         task_queue=task_queue,

@@ -90,6 +90,39 @@ class ConversationEventRow(Base):
     occurred_at: Mapped[str] = mapped_column(String(40))
 
 
+class ConversationGenerationRow(Base):
+    """一次 Agent 运行。会话是长期容器，generation 是可取消的短期任务。"""
+
+    __tablename__ = "conversation_generations"
+
+    generation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    buyer_id: Mapped[str] = mapped_column(String(64), index=True)
+    request_id: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    final_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_event_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (UniqueConstraint("session_id", "request_id", name="uq_generation_session_request"),)
+
+
+class ConversationGenerationEventRow(Base):
+    __tablename__ = "conversation_generation_events"
+
+    id: Mapped[int] = mapped_column(_AutoPk, primary_key=True, autoincrement=True)
+    generation_id: Mapped[str] = mapped_column(String(64), index=True)
+    seq: Mapped[int] = mapped_column(Integer)
+    type: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict] = mapped_column(JSON)
+    occurred_at: Mapped[str] = mapped_column(String(40))
+
+    __table_args__ = (UniqueConstraint("generation_id", "seq", name="uq_generation_event_seq"),)
+
+
 class AgentSessionStateRow(Base):
     """AgentState 全量快照。单会话一行，每轮覆盖写。"""
 

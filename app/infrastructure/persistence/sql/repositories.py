@@ -40,6 +40,7 @@ from app.domain.session.ports.conversation_store import (
     SessionSummary,
 )
 from app.domain.session.ports.session_store import SessionStore
+from app.domain.session.ports.generation_store import Generation, GenerationEvent, GenerationStore
 from app.infrastructure.persistence.sql.tables import (
     AgentSessionStateRow,
     Base,
@@ -47,6 +48,8 @@ from app.infrastructure.persistence.sql.tables import (
     ConversationEventRow,
     ConversationMessageRow,
     ConversationSessionRow,
+    ConversationGenerationRow,
+    ConversationGenerationEventRow,
     OrderLineRow,
     OrderRow,
 )
