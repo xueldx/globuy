@@ -228,7 +228,23 @@ export const useChatStore = create<ChatState>((set, get) => {
             active.lastSeq = envelope.seq ?? active.lastSeq;
             if (get().streamingMsgIdBySession[sessionId] !== assistantMsg.id) return;
             const payload = envelope.payload as { token?: string; text?: string; error?: string; message?: string };
-            if (event === "token.delta") {
+            if (event === "user.message") {
+              const text = payload.text?.trim();
+              if (text) {
+                set((s) => {
+                  const messages = s.messagesBySession[sessionId] ?? [];
+                  const recoveredId = `${generation.generation_id}:user`;
+                  if (messages.some((item) => item.id === recoveredId)) return {};
+                  const assistantIndex = messages.findIndex((item) => item.id === assistantMsg.id);
+                  const user: ChatMessage = {
+                    id: recoveredId, role: "user", content: text, status: "done", createdAt: nowISO(),
+                  };
+                  const next = [...messages];
+                  next.splice(assistantIndex < 0 ? next.length : assistantIndex, 0, user);
+                  return { messagesBySession: setKey(s.messagesBySession, sessionId, next) };
+                });
+              }
+            } else if (event === "token.delta") {
               set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, (s.streamingBySession[sessionId] ?? "") + (payload.token ?? "")) }));
             } else if (event === "final.result") {
               if (payload.text) set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, payload.text!) }));
@@ -385,6 +401,9 @@ export const useChatStore = create<ChatState>((set, get) => {
               const payload = envelope.payload;
               if (!isActive()) return;
               switch (event) {
+                case "user.message":
+                  // 当前发送链路已经乐观写入 user 消息；该事件只供刷新恢复使用。
+                  break;
                 case "token.delta": {
                   const token = (payload as { token?: string }).token ?? "";
                   if (!token) return;

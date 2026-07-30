@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from app.application.agents.orchestrator import SubmitIntentOutput
+from app.domain.session.ports.generation_store import Generation
 from app.infrastructure.eventbus import TradeEventBus
 from app.infrastructure.persistence.json_file_stores import JsonFileConversationStore
 from app.infrastructure.persistence.json_generation_store import JsonGenerationStore
@@ -67,6 +68,8 @@ def _wait_status(client: TestClient, generation_id: str, expected: str) -> dict:
 
 def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatch):
     container = _FakeContainer(tmp_path)
+    orphan = Generation("gen-orphan", "s-orphan", "buyer-api", "req-orphan", "running")
+    asyncio.run(container.generation_store.create_or_get(orphan))
 
     async def fake_build_container() -> _FakeContainer:
         return container
@@ -75,6 +78,17 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
     app = server.build_app()
 
     with TestClient(app) as client:
+        interrupted = client.get("/commerce/sessions/s-orphan/generations/latest")
+        assert interrupted.status_code == 404
+        assert client.get("/commerce/generations/gen-orphan").json() == {
+            "generation_id": "gen-orphan",
+            "session_id": "s-orphan",
+            "status": "failed",
+            "last_event_seq": 0,
+            "final_text": "",
+            "error_code": "orphaned_after_restart",
+        }
+
         created = client.post("/commerce/sessions/s-done/generations", json=_payload("req-same"))
         assert created.status_code == 200
         generation_id = created.json()["generation_id"]
@@ -87,12 +101,14 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
 
         replay = client.get(f"/commerce/generations/{generation_id}/events?after_seq=0")
         assert replay.status_code == 200
+        assert replay.text.count("event: user.message") == 1
         assert replay.text.count("event: token.delta") == 1
         assert replay.text.count("event: final.result") == 1
-        assert '"seq": 1' in replay.text and '"seq": 2' in replay.text
+        assert '"seq": 1' in replay.text and '"seq": 3' in replay.text
 
         after_first = client.get(f"/commerce/generations/{generation_id}/events?after_seq=1")
-        assert "event: token.delta" not in after_first.text
+        assert "event: user.message" not in after_first.text
+        assert after_first.text.count("event: token.delta") == 1
         assert after_first.text.count("event: final.result") == 1
 
         blocking = client.post(

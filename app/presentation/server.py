@@ -167,6 +167,12 @@ def build_app() -> FastAPI:
                 forwarder.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await forwarder
+            # 正常停服时主动收口本进程 generation，避免数据库遗留 running 僵尸状态。
+            generation_tasks = list(state.get("generation_tasks", {}).values())
+            for task in generation_tasks:
+                task.cancel()
+            if generation_tasks:
+                await asyncio.gather(*generation_tasks, return_exceptions=True)
             state.pop("c", None)
             await c.shutdown()
 
@@ -298,6 +304,12 @@ def build_app() -> FastAPI:
                     error_code="generation_limit_reached",
                 )
                 raise HTTPException(status_code=429, detail="generation_limit_reached")
+            # 正在运行的本轮尚未进入长期 turns。把用户原始输入作为首个可回放事件，
+            # 刷新恢复时才能同时重建 user 消息和 assistant 占位。
+            await c.generation_store.append_event(
+                generation.generation_id, "user.message", {"text": body.raw_query},
+                datetime.now(timezone.utc).isoformat(),
+            )
         await c.conversation_store.touch_session(session_id, body.buyer_id, body.locale, body.currency)
         if c.task_queue is not None:
             await _enqueue(c, SubmitIntentInput(
@@ -322,10 +334,20 @@ def build_app() -> FastAPI:
     @api.get("/commerce/sessions/{session_id}/generations/latest", response_model=GenerationOut)
     async def latest_active_generation(session_id: str) -> GenerationOut:
         """刷新恢复入口：只返回该会话仍未终态的一次运行。"""
-        active = await container().generation_store.list_active_for_session(session_id)
+        c = container()
+        active = await c.generation_store.list_active_for_session(session_id)
         if not active:
             raise HTTPException(status_code=404, detail="没有活跃 generation")
-        return generation_out(active[-1])
+        latest = active[-1]
+        if c.task_queue is None and latest.generation_id not in state.get("generation_tasks", {}):
+            # 直跑模式没有外部 worker。进程重启后仍为 active 的记录不可能自行恢复，
+            # 诚实标为失败，避免前端永远订阅一个没有执行者的 running 任务。
+            await c.generation_store.transition(
+                latest.generation_id, ("queued", "running", "cancelling"), "failed",
+                error_code="orphaned_after_restart",
+            )
+            raise HTTPException(status_code=404, detail="活跃 generation 已因服务重启中断")
+        return generation_out(latest)
 
     @api.delete("/commerce/generations/{generation_id}", response_model=GenerationOut)
     async def cancel_generation(generation_id: str) -> GenerationOut:
