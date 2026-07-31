@@ -1,12 +1,13 @@
 import { memo, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useParams } from "react-router-dom";
+import { SafeStreamingMarkdown } from "@/components/chat/SafeStreamingMarkdown";
 import { useChatStore } from "@/stores/chatStore";
 import type { ChatMessage } from "@/types";
 
 /** 空态共享引用：selector 在无分片时返回同一引用，避免每次 store 更新都重渲染 */
 const EMPTY_MESSAGES: ChatMessage[] = [];
 
-/** 聊天页：F2 SSE 流式 + F3 会话分片。Markdown（F4）/虚拟滚动（F5）后续替换气泡渲染。 */
+/** 聊天页：F2 SSE 流式 + F3 会话分片 + F4 安全流式 Markdown。 */
 export function Component() {
   const { sessionId } = useParams();
   const currentSessionId = useChatStore((s) => s.currentSessionId);
@@ -139,20 +140,26 @@ function MessageRow({ message }: { message: ChatMessage }) {
   return (
     <div className={`mb-3 flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
-        className={`max-w-[80%] rounded-lg border bg-surface px-3 py-2 text-sm ${
-          isUser ? "border-primary/30" : ""
+        className={`min-w-0 rounded-lg border bg-surface px-3 py-2 text-sm ${
+          isUser ? "max-w-[80%] border-primary/30" : "max-w-[88%]"
         }`}
       >
         {!isUser && <p className="mb-1 text-xs text-muted">Agent</p>}
-        <p className="whitespace-pre-wrap break-words">
-          {message.content}
+        {isUser ? (
+          <p className="whitespace-pre-wrap break-words">{message.content}</p>
+        ) : (
+          <SafeStreamingMarkdown content={message.content} messageId={message.id} />
+        )}
+        {!isUser && (
+          <p className="mt-1 text-xs text-muted">
           {message.status === "cancelled" && (
-            <span className="ml-1 text-xs text-muted">（已停止）</span>
+              <span>（已停止）</span>
           )}
           {message.status === "error" && (
-            <span className="ml-1 text-xs text-muted">（出错了）</span>
+              <span>（出错了）</span>
           )}
-        </p>
+          </p>
+        )}
       </div>
     </div>
   );
@@ -168,12 +175,13 @@ function StreamingBubble({ sessionId }: { sessionId: string }) {
   );
   return (
     <div className="mb-3 flex justify-start">
-      <div className="max-w-[80%] rounded-lg border bg-surface px-3 py-2 text-sm">
+      <div className="min-w-0 max-w-[88%] rounded-lg border bg-surface px-3 py-2 text-sm">
         <p className="mb-1 text-xs text-muted">Agent</p>
-        <p className="whitespace-pre-wrap break-words">
-          {streamingContent}
-          <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-primary align-middle" />
-        </p>
+        <SafeStreamingMarkdown
+          content={streamingContent}
+          isStreaming
+          messageId={`streaming-${sessionId}`}
+        />
       </div>
     </div>
   );
