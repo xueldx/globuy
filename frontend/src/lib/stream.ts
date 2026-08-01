@@ -1,140 +1,171 @@
 import { API_BASE } from "./api";
 
-/**
- * SSE 流式引擎：fetch POST + ReadableStream 帧解析。
- *
- * 为什么不用 EventSource：要 POST 携带意图 body（session/query），EventSource 只支持 GET 且不能带
- * 自定义 header；fetch 拿到 ReadableStream 后可做同样流式，且天然支持 AbortController 取消（停止生成）。
- * 帧解析器移植自 ragent `useStreamResponse.ts`：buffer 累积分片、按行切、空行触发派发、event:/data: 行协议。
- */
-
-export interface PostSSEOptions {
-  url: string;
-  body: unknown;
-  signal?: AbortSignal;
-  retryCount?: number;
-  retryDelayMs?: number;
-  /** 每收到一个完整帧回调（event 为事件名，payload 为 JSON 反序列化结果） */
-  onEvent: (event: string, payload: unknown) => void;
-  /** 重试耗尽或致命错误 */
-  onError?: (error: Error) => void;
+/** 传输层解析后的标准 SSE 事件。data 保持原始文本，由业务层决定如何反序列化。 */
+export interface SSEMessage {
+  event: string;
+  data: string;
+  id: string;
+  retry?: number;
 }
 
-function parseData(raw: string): unknown {
-  if (!raw) return "";
-  try {
-    return JSON.parse(raw);
-  } catch {
-    // data 非 JSON（理论上后端统一 JSON 化），原样交给上层
-    return raw;
+export class SSEHttpError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "SSEHttpError";
+    this.status = status;
   }
 }
 
-async function readSseStream(
+export class SSEProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SSEProtocolError";
+  }
+}
+
+type MessageHandler = (message: SSEMessage) => void;
+
+/**
+ * 从 buffer 中逐行取数据。末尾单独的 CR 先保留，因为下一 Chunk 可能以 LF 开头。
+ */
+function takeLine(buffer: string, eof = false): { line: string; rest: string } | null {
+  for (let index = 0; index < buffer.length; index += 1) {
+    const char = buffer[index];
+    if (char === "\n") {
+      return { line: buffer.slice(0, index), rest: buffer.slice(index + 1) };
+    }
+    if (char === "\r") {
+      if (index === buffer.length - 1) {
+        return eof ? { line: buffer.slice(0, index), rest: "" } : null;
+      }
+      const width = buffer[index + 1] === "\n" ? 2 : 1;
+      return { line: buffer.slice(0, index), rest: buffer.slice(index + width) };
+    }
+  }
+  return null;
+}
+
+/** 按 WHATWG 规则解析一条字段行，只移除冒号后的一个可选空格。 */
+function splitField(line: string): { field: string; value: string } {
+  const colon = line.indexOf(":");
+  if (colon < 0) return { field: line, value: "" };
+  let value = line.slice(colon + 1);
+  if (value.startsWith(" ")) value = value.slice(1);
+  return { field: line.slice(0, colon), value };
+}
+
+/**
+ * 读取并解析一个 SSE Response。
+ *
+ * 网络 Chunk 与 SSE Event 没有一一对应关系，因此先增量解码，再按空行派发完整事件。
+ * EOF 不会补发未闭合事件，这是 SSE 标准规定，也能避免把截断响应误判为完整业务数据。
+ */
+export async function readSSEStream(
   response: Response,
-  onEvent: PostSSEOptions["onEvent"],
+  onMessage: MessageHandler,
+  signal?: AbortSignal,
+  onRetry?: (retryMs: number) => void,
 ): Promise<void> {
-  if (!response.body) throw new Error("流式响应为空");
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!contentType.includes("text/event-stream")) {
+    throw new SSEProtocolError(`响应不是 SSE（Content-Type: ${contentType || "missing"}）`);
+  }
+  if (!response.body) throw new SSEProtocolError("流式响应为空");
+
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let eventName = "message";
   let dataLines: string[] = [];
+  let lastEventId = "";
+  let eventRetry: number | undefined;
+  let reachedEof = false;
 
   const dispatch = () => {
-    if (dataLines.length === 0) return;
-    onEvent(eventName, parseData(dataLines.join("\n")));
+    if (dataLines.length === 0) {
+      eventName = "message";
+      eventRetry = undefined;
+      return;
+    }
+    if (!signal?.aborted) {
+      onMessage({
+        event: eventName || "message",
+        data: dataLines.join("\n"),
+        id: lastEventId,
+        retry: eventRetry,
+      });
+    }
     eventName = "message";
     dataLines = [];
+    eventRetry = undefined;
   };
 
-  while (true) {
-    // signal 被 abort 时，本次 read() 会以 AbortError reject（标准行为），
-    // 取消沿 catch 上抛，调用方据此区分「停止」与「完成」，不做静默吞掉
-    const { value, done } = await reader.read();
-    if (done) {
-      dispatch();
-      break;
-    }
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    // 最后一段可能是不完整行，留回 buffer 等下一分片
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line) {
-        dispatch(); // 空行 = 帧结束
+  const processBufferedLines = (eof = false) => {
+    while (true) {
+      const next = takeLine(buffer, eof);
+      if (!next) return;
+      buffer = next.rest;
+      const line = next.line;
+      if (line === "") {
+        dispatch();
         continue;
       }
-      if (line.startsWith(":")) continue; // 注释/心跳行
-      if (line.startsWith("event:")) {
-        eventName = line.slice(6).trim();
-        continue;
-      }
-      if (line.startsWith("data:")) {
-        dataLines.push(line.slice(5).trim());
+      if (line.startsWith(":")) continue;
+
+      const { field, value } = splitField(line);
+      if (field === "event") {
+        eventName = value;
+      } else if (field === "data") {
+        dataLines.push(value);
+      } else if (field === "id" && !value.includes("\0")) {
+        lastEventId = value;
+      } else if (field === "retry" && /^\d+$/.test(value)) {
+        eventRetry = Number(value);
+        onRetry?.(eventRetry);
       }
     }
+  };
+
+  try {
+    while (!signal?.aborted) {
+      const { value, done } = await reader.read();
+      if (done) {
+        reachedEof = true;
+        buffer += decoder.decode();
+        processBufferedLines(true);
+        return;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      processBufferedLines();
+    }
+  } finally {
+    if (!reachedEof) {
+      await reader.cancel().catch(() => undefined);
+    }
+    reader.releaseLock();
   }
 }
 
-/**
- * POST 一个 SSE 流式请求。
- *
- * 重试边界（关键）：只对「连接建立前」的瞬时失败做指数退避重试——此刻请求还没发出去、
- * 服务端还没开始生成，重发无副作用。一旦开始收流（readSseStream 进行中），任何错误都
- * **直接上抛不再重试**——重发会重复调用 LLM/Agent 产生重复回复（非幂等）。服务端正常
- * 收流（final.result 后关闭）视为成功返回。非 2xx 是服务端明确拒绝，同样不重试。
- */
-export async function postSSE(options: PostSSEOptions): Promise<void> {
-  const retryCount = options.retryCount ?? 1;
-  const retryDelayMs = options.retryDelayMs ?? 600;
-  let attempt = 0;
-
-  // 阶段一：连接建立（唯一允许重试的阶段）
-  let response: Response;
-  while (true) {
-    try {
-      response = await fetch(`${API_BASE}${options.url}`, {
-        method: "POST",
-        headers: {
-          Accept: "text/event-stream",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(options.body),
-        signal: options.signal,
-      });
-      break;
-    } catch (error) {
-      const err = error as Error;
-      if (options.signal?.aborted) throw err; // 主动取消不算错误，直接上抛
-      if (attempt >= retryCount) {
-        options.onError?.(err);
-        throw err;
-      }
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs * 2 ** attempt));
-      attempt += 1;
-    }
-  }
-
-  if (!response.ok) {
-    const err = new Error(`SSE 请求失败（${response.status}）`);
-    options.onError?.(err);
-    throw err;
-  }
-
-  // 阶段二：流一旦开始，绝不再发第二次
-  await readSseStream(response, options.onEvent);
+export interface SubscribeSSEOptions {
+  url: string;
+  signal?: AbortSignal;
+  headers?: Record<string, string>;
+  onMessage: MessageHandler;
+  onRetry?: (retryMs: number) => void;
 }
 
-/** 订阅已创建的 generation。abort 只关闭这条观看连接，不会取消服务端任务。 */
-export async function subscribeSSE(
-  url: string,
-  onEvent: PostSSEOptions["onEvent"],
-  signal?: AbortSignal,
-): Promise<void> {
-  const response = await fetch(`${API_BASE}${url}`, {
-    headers: { Accept: "text/event-stream" }, signal,
+/** GET 订阅已存在的 generation。Abort 只关闭观看连接，不会取消服务端任务。 */
+export async function subscribeSSE(options: SubscribeSSEOptions): Promise<void> {
+  const response = await fetch(`${API_BASE}${options.url}`, {
+    method: "GET",
+    headers: { Accept: "text/event-stream", ...options.headers },
+    signal: options.signal,
   });
-  if (!response.ok) throw new Error(`SSE 订阅失败（${response.status}）`);
-  await readSseStream(response, onEvent);
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new SSEHttpError(response.status, detail || `SSE 订阅失败（${response.status}）`);
+  }
+  await readSSEStream(response, options.onMessage, options.signal, options.onRetry);
 }
