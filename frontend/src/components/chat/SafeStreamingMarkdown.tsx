@@ -13,7 +13,6 @@ import {
   type StreamdownTranslations,
   type UrlTransform,
 } from "streamdown";
-import { useRafBatchedValue } from "@/hooks/useRafBatchedValue";
 
 const ALLOWED_ELEMENTS = [
   "a",
@@ -97,18 +96,16 @@ interface SafeStreamingMarkdownProps {
 
 /**
  * F4 的唯一 Markdown 入口。
- * 流式阶段每帧最多解析一次；结束后用原始完整文本静态重渲染，清除补全猜测。
+ * 上游 chatStore 已按浏览器帧合并流式 token；结束后切到静态模式，清除补全猜测。
  */
 export function SafeStreamingMarkdown({
   content,
   isStreaming = false,
   messageId,
 }: SafeStreamingMarkdownProps) {
-  const renderedContent = useRafBatchedValue(content, !isStreaming);
-
   return (
     <MarkdownErrorBoundary content={content} key={messageId}>
-      <MarkdownContent content={renderedContent} isStreaming={isStreaming} />
+      <MarkdownContent content={content} isStreaming={isStreaming} />
     </MarkdownErrorBoundary>
   );
 }

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { ChatMessage, ChatMessageStatus, SessionSummary, SessionTurn, TradeEventType } from "@/types";
 import { ApiError } from "@/lib/api";
+import { createRafTextBuffer } from "@/lib/rafTextBuffer";
 import {
   DEMO_BUYER_ID,
   deleteSession as apiDeleteSession,
@@ -110,6 +111,20 @@ function delKey<T>(map: Record<string, T>, key: string): Record<string, T> {
  */
 const activeStreams = new Map<string, AbortController>();
 const activeGenerations = new Map<string, { generationId: string; lastSeq: number }>();
+const pendingCancels = new Set<string>();
+
+/**
+ * token 先写模块内 pending 文本，再在下一浏览器帧一次提交到 Zustand。
+ * 这样同一帧内无论收到多少 delta，React 都只看到一个新快照。
+ */
+function createStreamRenderBuffer(sessionId: string, messageId: string, initial = "") {
+  return createRafTextBuffer(initial, (pending) => {
+    if (useChatStore.getState().streamingMsgIdBySession[sessionId] !== messageId) return;
+    useChatStore.setState((state) => ({
+      streamingBySession: setKey(state.streamingBySession, sessionId, pending),
+    }));
+  });
+}
 
 // 一次性提示的自动熄灭定时器
 let noticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -221,6 +236,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           const controller = new AbortController();
           activeStreams.set(sessionId, controller);
           activeGenerations.set(sessionId, { generationId: generation.generation_id, lastSeq: 0 });
+          const renderer = createStreamRenderBuffer(sessionId, assistantMsg.id);
           void subscribeGenerationWithResume(generation.generation_id, 0, (event, raw) => {
             const envelope = raw as { generation_id?: string; seq?: number; payload?: unknown };
             const active = activeGenerations.get(sessionId);
@@ -245,25 +261,35 @@ export const useChatStore = create<ChatState>((set, get) => {
                 });
               }
             } else if (event === "token.delta") {
-              set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, (s.streamingBySession[sessionId] ?? "") + (payload.token ?? "")) }));
+              renderer.append(payload.token ?? "");
             } else if (event === "final.result") {
-              if (payload.text) set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, payload.text!) }));
+              if (typeof payload.text === "string") renderer.replaceAndFlush(payload.text);
+              else renderer.flush();
               finalizeStream(sessionId, assistantMsg.id, "done");
             } else if (event === "cancelled") {
+              renderer.flush();
               finalizeStream(sessionId, assistantMsg.id, "cancelled");
             } else if (event === "error") {
               const text = payload.error ?? payload.message;
-              if (text) set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, text) }));
+              if (!renderer.hasContent() && text) renderer.replaceAndFlush(text);
+              else renderer.flush();
               finalizeStream(sessionId, assistantMsg.id, "error");
             }
           }, controller.signal).catch((err) => {
             if (!controller.signal.aborted && get().streamingMsgIdBySession[sessionId] === assistantMsg.id) {
-              set((s) => ({ streamingBySession: setKey(s.streamingBySession, sessionId, `[interrupted] ${(err as Error).message}`) }));
+              if (!renderer.hasContent()) {
+                renderer.replaceAndFlush(`[interrupted] ${(err as Error).message}`);
+              } else {
+                renderer.flush();
+              }
               finalizeStream(sessionId, assistantMsg.id, "error");
             }
           }).finally(() => {
+            renderer.dispose();
             if (activeStreams.get(sessionId) === controller) activeStreams.delete(sessionId);
-            activeGenerations.delete(sessionId);
+            if (activeGenerations.get(sessionId)?.generationId === generation.generation_id) {
+              activeGenerations.delete(sessionId);
+            }
           });
           return;
         }
@@ -372,6 +398,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       activeStreams.set(sid, controller);
       // 竞态守卫（per-session）：A 的 token 只写 A 的分片，且只在还是激活消息时才写
       const isActive = () => get().streamingMsgIdBySession[sid] === assistantMsg.id;
+      const renderer = createStreamRenderBuffer(sid, assistantMsg.id);
 
       const finalize = (status: ChatMessageStatus) => {
         finalizeStream(sid, assistantMsg.id, status);
@@ -381,6 +408,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
       };
 
+      let ownedGenerationId: string | undefined;
       try {
         const generation = await createGeneration(sid, {
             request_id: makeId("req"),
@@ -389,7 +417,9 @@ export const useChatStore = create<ChatState>((set, get) => {
             currency: "CNY",
             raw_query: query,
         });
+        ownedGenerationId = generation.generation_id;
         activeGenerations.set(sid, { generationId: generation.generation_id, lastSeq: 0 });
+        if (pendingCancels.delete(sid)) await cancelGeneration(generation.generation_id);
         await subscribeGenerationWithResume(
           generation.generation_id,
           0,
@@ -407,27 +437,18 @@ export const useChatStore = create<ChatState>((set, get) => {
                 case "token.delta": {
                   const token = (payload as { token?: string }).token ?? "";
                   if (!token) return;
-                  // 只更新本会话分片的文本：别的会话分片与消息列表引用都不动
-                  set((s) => ({
-                    streamingBySession: setKey(
-                      s.streamingBySession,
-                      sid,
-                      (s.streamingBySession[sid] ?? "") + token,
-                    ),
-                  }));
+                  renderer.append(token);
                   break;
                 }
                 case "final.result": {
                   const text = (payload as { text?: string }).text;
-                  if (typeof text === "string") {
-                    set((s) => ({
-                      streamingBySession: setKey(s.streamingBySession, sid, text),
-                    }));
-                  }
+                  if (typeof text === "string") renderer.replaceAndFlush(text);
+                  else renderer.flush();
                   finalize("done");
                   break;
                 }
                 case "cancelled": {
+                  renderer.flush();
                   finalize("cancelled");
                   break;
                 }
@@ -436,11 +457,8 @@ export const useChatStore = create<ChatState>((set, get) => {
                   // 只有 SSE 超时的合成帧用 {error}。两个 key 都读，别让真实错误只剩空气泡。
                   const data = payload as { error?: string; message?: string };
                   const message = data.error ?? data.message;
-                  if (message) {
-                    set((s) => ({
-                      streamingBySession: setKey(s.streamingBySession, sid, message),
-                    }));
-                  }
+                  if (!renderer.hasContent() && message) renderer.replaceAndFlush(message);
+                  else renderer.flush();
                   finalize("error");
                   break;
                 }
@@ -462,22 +480,29 @@ export const useChatStore = create<ChatState>((set, get) => {
           },
           controller.signal,
         );
-        // 正常收流但没等来 final.result（服务端异常关闭）：统一收口
-        if (isActive()) finalize(controller.signal.aborted ? "cancelled" : "done");
       } catch (err) {
         // abort（用户点停止 / 删除掐流）→ cancelled；其他（fetch 失败等）→ error
         if (!isActive()) return true;
-        if (controller.signal.aborted) finalize("cancelled");
+        if (controller.signal.aborted) {
+          renderer.flush();
+          finalize("cancelled");
+        }
         else {
-          const text =
-            get().streamingBySession[sid] || `[error] ${(err as Error)?.message ?? "请求失败"}`;
-          set((s) => ({ streamingBySession: setKey(s.streamingBySession, sid, text) }));
+          if (!renderer.hasContent()) {
+            renderer.replaceAndFlush(`[error] ${(err as Error)?.message ?? "请求失败"}`);
+          } else {
+            renderer.flush();
+          }
           finalize("error");
         }
       } finally {
+        renderer.dispose();
+        pendingCancels.delete(sid);
         // 只删自己这个 controller：不误伤同会话新起的流（本版本同会话同一时刻仅一条）
         if (activeStreams.get(sid) === controller) activeStreams.delete(sid);
-        activeGenerations.delete(sid);
+        if (ownedGenerationId && activeGenerations.get(sid)?.generationId === ownedGenerationId) {
+          activeGenerations.delete(sid);
+        }
       }
       return true;
     },
@@ -491,8 +516,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         void cancelGeneration(generation.generationId).catch((err) => {
           flashNotice(set, `取消失败：${(err as Error).message}`);
         });
-      } else {
-        activeStreams.get(sid)?.abort();
+      } else if (activeStreams.has(sid)) {
+        // generation 创建接口很快，但仍可能处于“请求已到服务端、响应未回来”的窗口。
+        // 此时 Abort 会丢失 generationId，无法向服务端取消；先记下意图，拿到 id 后立即 DELETE。
+        pendingCancels.add(sid);
       }
     },
 
