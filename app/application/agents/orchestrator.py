@@ -69,8 +69,7 @@ _MAX_TURN_RETRIES = 2
 _RETRY_BASE_SECONDS = 6.0
 
 # 自动标题等 fire-and-forget 后台任务的强引用集合：防协程返回后被 GC 提前回收。
-# 与 server.py 的 _track_stream_task / eventbus 的 _broadcast 同一模式，
-# 完成即经 done_callback 移除。
+# 与 generation task registry / eventbus 的 _broadcast 同一模式，完成即经 done_callback 移除。
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 

@@ -122,12 +122,30 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
         assert replay.text.count("event: user.message") == 1
         assert replay.text.count("event: token.delta") == 1
         assert replay.text.count("event: final.result") == 1
+        assert replay.text.count("id: ") == 3
+        assert "id: 1\n" in replay.text and "id: 3\n" in replay.text
         assert '"seq": 1' in replay.text and '"seq": 3' in replay.text
 
         after_first = client.get(f"/commerce/generations/{generation_id}/events?after_seq=1")
         assert "event: user.message" not in after_first.text
         assert after_first.text.count("event: token.delta") == 1
         assert after_first.text.count("event: final.result") == 1
+
+        from_header = client.get(
+            f"/commerce/generations/{generation_id}/events",
+            headers={"Last-Event-ID": "1"},
+        )
+        assert from_header.text == after_first.text
+        conflict = client.get(
+            f"/commerce/generations/{generation_id}/events?after_seq=1",
+            headers={"Last-Event-ID": "2"},
+        )
+        assert conflict.status_code == 400
+        invalid_header = client.get(
+            f"/commerce/generations/{generation_id}/events",
+            headers={"Last-Event-ID": "not-a-number"},
+        )
+        assert invalid_header.status_code == 400
 
         blocking = client.post(
             "/commerce/sessions/s-cancel/generations", json=_payload("req-cancel", "block"),
@@ -152,6 +170,18 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
         assert "I notice the interruption" not in swallowed_events
         assert "event: final.result" not in swallowed_events
         assert swallowed_events.count("event: cancelled") == 1
+
+        serial = client.post(
+            "/commerce/sessions/s-serial/generations", json=_payload("req-serial-1", "block"),
+        )
+        serial_id = serial.json()["generation_id"]
+        same_session = client.post(
+            "/commerce/sessions/s-serial/generations", json=_payload("req-serial-2", "block"),
+        )
+        assert same_session.status_code == 409
+        assert same_session.json()["detail"] == "session_generation_in_progress"
+        client.delete(f"/commerce/generations/{serial_id}")
+        _wait_status(client, serial_id, "cancelled")
 
         active_ids: list[str] = []
         for index in range(3):

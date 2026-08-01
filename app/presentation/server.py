@@ -4,7 +4,9 @@
 路由：
     POST /commerce/intents                 提交买家意图（同步返回最终回复；启用队列时内部入队后等结果）
     POST /commerce/intents/async           提交买家意图（立即返回 task_id，结果走 WS 或轮询）
-    POST /commerce/stream                  提交买家意图并 SSE 流式返回该会话事件（F2 前端主链路）
+    POST /commerce/sessions/{id}/generations  幂等创建一次 Agent 运行
+    GET  /commerce/generations/{id}/events    订阅并恢复该运行的 SSE 事件
+    DELETE /commerce/generations/{id}          请求取消该运行
     GET  /commerce/tasks/{task_id}         查任务状态（queued / running / done / failed）
     WS   /commerce/events                  订阅会话事件流
     GET  /commerce/orders/{order_id}       查询订单（直连 UseCase，不过 Agent）
@@ -37,7 +39,7 @@ from contextlib import asynccontextmanager
 
 from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, Header, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
@@ -266,37 +268,6 @@ def build_app() -> FastAPI:
         task_id = await _enqueue(c, intent)
         return {"shopping_session_id": session_id, "task_id": task_id, "state": "queued"}
 
-    @api.post("/commerce/stream")
-    async def stream_intent(body: SubmitIntentRequest) -> StreamingResponse:
-        """SSE 流式端点：提交意图后把该会话的 token.delta/过程事件/final.result 逐帧推送。
-
-        与同步 /commerce/intents 同策略（队列启用则入队，否则直跑），但**先订阅再启动**，
-        避免「任务已开始、订阅未就绪」的窗口期丢事件。
-        """
-        c = container()
-        session_id = body.shopping_session_id or f"session-{uuid.uuid4().hex[:8]}"
-        intent = SubmitIntentInput(
-            shopping_session_id=session_id,
-            buyer_id=body.buyer_id,
-            locale=body.locale,
-            currency=body.currency,
-            raw_query=body.raw_query,
-        )
-        queue = c.bus.subscribe(session_id)
-        try:
-            if c.task_queue is None:
-                _track_stream_task(asyncio.create_task(c.orchestrator.handle_intent(intent)))
-            else:
-                await _enqueue(c, intent)
-        except Exception:
-            c.bus.unsubscribe(session_id, queue)
-            raise
-        return StreamingResponse(
-            _stream_events(c, session_id, queue, c.settings.queue_wait_seconds),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        )
-
     @api.post("/commerce/sessions/{session_id}/generations", response_model=GenerationOut)
     async def create_generation(session_id: str, body: CreateGenerationRequest) -> GenerationOut:
         """幂等创建一次运行。SSE 订阅另走 generation 事件端点。"""
@@ -310,6 +281,13 @@ def build_app() -> FastAPI:
             saved, created = await c.generation_store.create_or_get(generation)
             if not created:
                 return generation_out(saved)
+            active_in_session = await c.generation_store.list_active_for_session(session_id)
+            if any(item.generation_id != generation.generation_id for item in active_in_session):
+                await c.generation_store.transition(
+                    generation.generation_id, ("queued",), "failed",
+                    error_code="session_generation_in_progress",
+                )
+                raise HTTPException(status_code=409, detail="session_generation_in_progress")
             if await c.generation_store.count_active(body.buyer_id) > 3:
                 await c.generation_store.transition(
                     generation.generation_id, ("queued",), "failed",
@@ -373,19 +351,37 @@ def build_app() -> FastAPI:
         return generation_out(generation)
 
     @api.get("/commerce/generations/{generation_id}/events")
-    async def generation_events(generation_id: str, after_seq: int = 0) -> StreamingResponse:
+    async def generation_events(
+        generation_id: str,
+        after_seq: Optional[int] = None,
+        last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
         c = container()
         if await c.generation_store.get(generation_id) is None:
             raise HTTPException(status_code=404, detail="generation 不存在")
+        if after_seq is not None and after_seq < 0:
+            raise HTTPException(status_code=400, detail="after_seq 必须是非负整数")
+        header_seq: Optional[int] = None
+        if last_event_id is not None:
+            try:
+                header_seq = int(last_event_id)
+            except ValueError as err:
+                raise HTTPException(status_code=400, detail="Last-Event-ID 必须是非负整数") from err
+            if header_seq < 0:
+                raise HTTPException(status_code=400, detail="Last-Event-ID 必须是非负整数")
+        if after_seq is not None and header_seq is not None and after_seq != header_seq:
+            raise HTTPException(status_code=400, detail="恢复游标不一致")
+        resume_seq = after_seq if after_seq is not None else (header_seq or 0)
+
         async def stream() -> AsyncGenerator[str, None]:
-            cursor = max(0, after_seq)
+            cursor = resume_seq
             idle_polls = 0
             while True:
                 events = await c.generation_store.list_events(generation_id, cursor)
                 for item in events:
                     cursor = item.seq
                     payload = json.dumps({"generation_id": generation_id, "seq": item.seq, "payload": item.payload}, ensure_ascii=False)
-                    yield f"event: {item.type}\ndata: {payload}\n\n"
+                    yield f"id: {item.seq}\nevent: {item.type}\ndata: {payload}\n\n"
                 if events:
                     idle_polls = 0
                 generation = await c.generation_store.get(generation_id)
@@ -573,45 +569,6 @@ async def _await_result(c: Container, task_id: str, session_id: str) -> str:
             if event.type == "final.result":
                 return str(event.payload.get("text", ""))
         return "[error] 处理超时，请稍后重试或改用异步接口查询任务状态"
-    finally:
-        c.bus.unsubscribe(session_id, queue)
-
-
-# ===== SSE 流式端点（F2）=====
-# 后台任务的强引用集合：防止协程返回后任务被 GC 回收
-_STREAM_TASKS: set[asyncio.Task] = set()
-
-
-def _track_stream_task(task: asyncio.Task) -> None:
-    _STREAM_TASKS.add(task)
-    task.add_done_callback(_STREAM_TASKS.discard)
-
-
-async def _stream_events(
-    c: Container,
-    session_id: str,
-    queue: asyncio.Queue,
-    timeout: float,
-) -> AsyncGenerator[str, None]:
-    """订阅总线并逐事件产出 SSE 帧，直到 final.result / error / 超时。
-
-    跨进程事件：worker 产生的事件经 backplane forwarder deliver_local 到本进程总线，
-    与 WS 订阅同机制，这里订阅同一队列即可收到。
-    """
-    deadline = time.monotonic() + timeout
-    try:
-        while time.monotonic() < deadline:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=2.0)
-            except asyncio.TimeoutError:
-                # 注释行是 SSE 心跳，防止中间代理静默断开；前端解析器会跳过 ": " 行
-                yield ": keepalive\n\n"
-                continue
-            payload = json.dumps(event.payload, ensure_ascii=False)
-            yield f"event: {event.type}\ndata: {payload}\n\n"
-            if event.type in ("final.result", "error"):
-                return
-        yield 'event: error\ndata: {"error":"处理超时，请稍后重试"}\n\n'
     finally:
         c.bus.unsubscribe(session_id, queue)
 
