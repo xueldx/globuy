@@ -6,13 +6,17 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app.application.agents.orchestrator import SubmitIntentOutput
+from app.application.auth.service import AuthService
 from app.domain.session.ports.generation_store import Generation
 from app.infrastructure.eventbus import TradeEventBus
 from app.infrastructure.persistence.json_file_stores import JsonFileConversationStore
 from app.infrastructure.persistence.json_generation_store import JsonGenerationStore
+from app.infrastructure.persistence.json_auth_store import JsonAuthStore
 from app.presentation import server
 
 
@@ -43,9 +47,11 @@ class _FakeContainer:
         self.orchestrator = _FakeOrchestrator(self.bus)
         self.conversation_store = JsonFileConversationStore(data_dir)
         self.generation_store = JsonGenerationStore(data_dir)
+        self.auth_service = AuthService(JsonAuthStore(data_dir))
         self.task_queue = None
         self.backplane = None
-        self.settings = SimpleNamespace()
+        self.cache = SimpleNamespace(enabled=False)
+        self.settings = SimpleNamespace(auth_session_ttl_seconds=604800, auth_cookie_secure=False)
 
     async def startup(self) -> None:
         return None
@@ -57,11 +63,14 @@ class _FakeContainer:
 def _payload(request_id: str, raw_query: str = "hello") -> dict[str, str]:
     return {
         "request_id": request_id,
-        "buyer_id": "buyer-api",
         "locale": "zh-CN",
         "currency": "CNY",
         "raw_query": raw_query,
     }
+
+
+def _csrf(client: TestClient) -> dict[str, str]:
+    return {"X-CSRF-Token": client.cookies.get("globuy_csrf") or ""}
 
 
 def _wait_status(client: TestClient, generation_id: str, expected: str) -> dict:
@@ -86,9 +95,6 @@ def _wait_seq(client: TestClient, generation_id: str, minimum: int) -> None:
 
 def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatch):
     container = _FakeContainer(tmp_path)
-    orphan = Generation("gen-orphan", "s-orphan", "buyer-api", "req-orphan", "running")
-    asyncio.run(container.generation_store.create_or_get(orphan))
-
     async def fake_build_container() -> _FakeContainer:
         return container
 
@@ -96,6 +102,17 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
     app = server.build_app()
 
     with TestClient(app) as client:
+        registered = client.post("/auth/register", json={
+            "email": "buyer-api@example.com",
+            "display_name": "Buyer API",
+            "password": "strong-password",
+        })
+        assert registered.status_code == 201
+        buyer_id = registered.json()["user_id"]
+        asyncio.run(container.conversation_store.touch_session("s-orphan", buyer_id, "zh-CN", "CNY"))
+        orphan = Generation("gen-orphan", "s-orphan", buyer_id, "req-orphan", "running")
+        asyncio.run(container.generation_store.create_or_get(orphan))
+
         interrupted = client.get("/commerce/sessions/s-orphan/generations/latest")
         assert interrupted.status_code == 404
         assert client.get("/commerce/generations/gen-orphan").json() == {
@@ -107,13 +124,13 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
             "error_code": "orphaned_after_restart",
         }
 
-        created = client.post("/commerce/sessions/s-done/generations", json=_payload("req-same"))
+        created = client.post("/commerce/sessions/s-done/generations", json=_payload("req-same"), headers=_csrf(client))
         assert created.status_code == 200
         generation_id = created.json()["generation_id"]
         completed = _wait_status(client, generation_id, "completed")
         assert completed["final_text"] == "ok"
 
-        duplicate = client.post("/commerce/sessions/s-done/generations", json=_payload("req-same"))
+        duplicate = client.post("/commerce/sessions/s-done/generations", json=_payload("req-same"), headers=_csrf(client))
         assert duplicate.status_code == 200
         assert duplicate.json()["generation_id"] == generation_id
 
@@ -149,9 +166,10 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
 
         blocking = client.post(
             "/commerce/sessions/s-cancel/generations", json=_payload("req-cancel", "block"),
+            headers=_csrf(client),
         )
         cancelled_id = blocking.json()["generation_id"]
-        cancelled = client.delete(f"/commerce/generations/{cancelled_id}")
+        cancelled = client.delete(f"/commerce/generations/{cancelled_id}", headers=_csrf(client))
         assert cancelled.status_code == 200
         _wait_status(client, cancelled_id, "cancelled")
         cancel_events = client.get(f"/commerce/generations/{cancelled_id}/events").text
@@ -160,10 +178,11 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
         swallowed = client.post(
             "/commerce/sessions/s-swallow/generations",
             json=_payload("req-swallow", "swallow-cancel"),
+            headers=_csrf(client),
         )
         swallowed_id = swallowed.json()["generation_id"]
         _wait_seq(client, swallowed_id, 2)
-        client.delete(f"/commerce/generations/{swallowed_id}")
+        client.delete(f"/commerce/generations/{swallowed_id}", headers=_csrf(client))
         _wait_status(client, swallowed_id, "cancelled")
         swallowed_events = client.get(f"/commerce/generations/{swallowed_id}/events").text
         assert "partial" in swallowed_events
@@ -173,14 +192,16 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
 
         serial = client.post(
             "/commerce/sessions/s-serial/generations", json=_payload("req-serial-1", "block"),
+            headers=_csrf(client),
         )
         serial_id = serial.json()["generation_id"]
         same_session = client.post(
             "/commerce/sessions/s-serial/generations", json=_payload("req-serial-2", "block"),
+            headers=_csrf(client),
         )
         assert same_session.status_code == 409
         assert same_session.json()["detail"] == "session_generation_in_progress"
-        client.delete(f"/commerce/generations/{serial_id}")
+        client.delete(f"/commerce/generations/{serial_id}", headers=_csrf(client))
         _wait_status(client, serial_id, "cancelled")
 
         active_ids: list[str] = []
@@ -188,16 +209,126 @@ def test_generation_api_idempotency_replay_cancel_and_limit(tmp_path, monkeypatc
             response = client.post(
                 f"/commerce/sessions/s-limit-{index}/generations",
                 json=_payload(f"req-limit-{index}", "block"),
+                headers=_csrf(client),
             )
             assert response.status_code == 200
             active_ids.append(response.json()["generation_id"])
 
         rejected = client.post(
             "/commerce/sessions/s-limit-4/generations", json=_payload("req-limit-4", "block"),
+            headers=_csrf(client),
         )
         assert rejected.status_code == 429
         assert rejected.json()["detail"] == "generation_limit_reached"
 
         for active_id in active_ids:
-            client.delete(f"/commerce/generations/{active_id}")
+            client.delete(f"/commerce/generations/{active_id}", headers=_csrf(client))
             _wait_status(client, active_id, "cancelled")
+
+
+def test_generation_requires_login_csrf_and_owner(tmp_path, monkeypatch):
+    container = _FakeContainer(tmp_path)
+
+    async def fake_build_container() -> _FakeContainer:
+        return container
+
+    monkeypatch.setattr(server, "build_container", fake_build_container)
+    app = server.build_app()
+
+    with TestClient(app) as client:
+        anonymous = client.post(
+            "/commerce/sessions/private-session/generations",
+            json=_payload("anonymous"),
+        )
+        assert anonymous.status_code == 401
+        with pytest.raises(WebSocketDisconnect) as anonymous_ws:
+            with client.websocket_connect("/commerce/events"):
+                pass
+        assert anonymous_ws.value.code == 4401
+
+        user_a = client.post("/auth/register", json={
+            "email": "owner-a@example.com",
+            "display_name": "Owner A",
+            "password": "strong-password",
+        })
+        assert user_a.status_code == 201
+        a_session = client.cookies.get("globuy_session") or ""
+        a_csrf = client.cookies.get("globuy_csrf") or ""
+
+        missing_csrf = client.post(
+            "/commerce/sessions/private-session/generations",
+            json=_payload("missing-csrf"),
+        )
+        assert missing_csrf.status_code == 403
+
+        unavailable_async = client.post(
+            "/commerce/intents/async",
+            json={
+                "shopping_session_id": "must-not-be-created",
+                "locale": "zh-CN",
+                "currency": "CNY",
+                "raw_query": "队列未启用",
+            },
+            headers=_csrf(client),
+        )
+        assert unavailable_async.status_code == 503
+        assert asyncio.run(
+            container.conversation_store.find_session("must-not-be-created"),
+        ) is None
+
+        spoofed_identity = client.post(
+            "/commerce/sessions/private-session/generations",
+            json={**_payload("spoofed"), "buyer_id": "buyer-someone-else"},
+            headers=_csrf(client),
+        )
+        assert spoofed_identity.status_code == 422
+
+        created = client.post(
+            "/commerce/sessions/private-session/generations",
+            json=_payload("owner-request"),
+            headers=_csrf(client),
+        )
+        assert created.status_code == 200
+        generation_id = created.json()["generation_id"]
+        _wait_status(client, generation_id, "completed")
+
+        client.cookies.clear()
+        user_b = client.post("/auth/register", json={
+            "email": "owner-b@example.com",
+            "display_name": "Owner B",
+            "password": "strong-password",
+        })
+        assert user_b.status_code == 201
+
+        assert client.get(f"/commerce/generations/{generation_id}").status_code == 404
+        assert client.get(f"/commerce/generations/{generation_id}/events").status_code == 404
+        assert client.delete(
+            f"/commerce/generations/{generation_id}", headers=_csrf(client),
+        ).status_code == 404
+        assert client.get("/commerce/sessions/private-session/turns").status_code == 404
+        assert client.post(
+            "/commerce/sessions/private-session/generations",
+            json=_payload("owner-b-request"),
+            headers=_csrf(client),
+        ).status_code == 404
+        assert client.post(
+            "/commerce/intents",
+            json={
+                "shopping_session_id": "private-session",
+                "locale": "zh-CN",
+                "currency": "CNY",
+                "raw_query": "尝试接管别人的会话",
+            },
+            headers=_csrf(client),
+        ).status_code == 404
+        with client.websocket_connect("/commerce/events") as websocket:
+            websocket.send_json({"shopping_session_id": "private-session"})
+            with pytest.raises(WebSocketDisconnect) as forbidden_ws:
+                websocket.receive_json()
+            assert forbidden_ws.value.code == 4404
+        assert all(item["id"] != "private-session" for item in client.get("/commerce/sessions").json())
+
+        client.cookies.clear()
+        client.cookies.set("globuy_session", a_session)
+        client.cookies.set("globuy_csrf", a_csrf)
+        assert client.get(f"/commerce/generations/{generation_id}").status_code == 200

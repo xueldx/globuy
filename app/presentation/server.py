@@ -39,12 +39,13 @@ from contextlib import asynccontextmanager
 
 from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, Header, HTTPException, WebSocket
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
 from app.application.agents.orchestrator import SubmitIntentInput
+from app.application.auth.service import AuthContext, AuthError, EmailAlreadyExists, IssuedSession
 from app.composition import Container, build_container
 from app.domain.queue.ports.task_queue import IntentTask, TaskStatus
 from app.presentation.connection import ConnectionManager
@@ -57,6 +58,9 @@ from app.presentation.dto import (
     TurnOut,
     CreateGenerationRequest,
     GenerationOut,
+    RegisterRequest,
+    LoginRequest,
+    CurrentUserOut,
 )
 from app.domain.session.ports.generation_store import Generation
 
@@ -68,6 +72,11 @@ logger = logging.getLogger(__name__)
 _IDEMPOTENCY_TTL_SECONDS = 600
 # 轮数计数器存活时长：比幂等窗口长得多，让一整段会话都能被正确分类
 _TURN_COUNTER_TTL_SECONDS = 86400
+_SESSION_COOKIE = "globuy_session"
+_CSRF_COOKIE = "globuy_csrf"
+_LOGIN_WINDOW_SECONDS = 60
+_LOGIN_ATTEMPT_LIMIT = 5
+_LOCAL_LOGIN_BUCKET_LIMIT = 4096
 
 
 def build_app() -> FastAPI:
@@ -197,6 +206,126 @@ def build_app() -> FastAPI:
             raise HTTPException(status_code=503, detail="服务尚未就绪")
         return state["c"]
 
+    def current_user_out(context: AuthContext) -> CurrentUserOut:
+        return CurrentUserOut(
+            user_id=context.user.user_id,
+            email=context.user.email,
+            display_name=context.user.display_name,
+        )
+
+    def set_auth_cookies(response: Response, issued: IssuedSession) -> None:
+        settings = container().settings
+        response.headers["Cache-Control"] = "no-store"
+        common = {
+            "max_age": settings.auth_session_ttl_seconds,
+            "secure": settings.auth_cookie_secure,
+            "samesite": "lax",
+            "path": "/",
+        }
+        response.set_cookie(_SESSION_COOKIE, issued.token, httponly=True, **common)
+        response.set_cookie(_CSRF_COOKIE, issued.csrf_token, httponly=False, **common)
+
+    def clear_auth_cookies(response: Response) -> None:
+        settings = container().settings
+        response.headers["Cache-Control"] = "no-store"
+        response.delete_cookie(
+            _SESSION_COOKIE, path="/", secure=settings.auth_cookie_secure, samesite="lax",
+        )
+        response.delete_cookie(
+            _CSRF_COOKIE, path="/", secure=settings.auth_cookie_secure, samesite="lax",
+        )
+
+    async def require_auth(request: Request) -> AuthContext:
+        token = request.cookies.get(_SESSION_COOKIE, "")
+        try:
+            return await container().auth_service.resolve(token)
+        except AuthError as err:
+            raise HTTPException(
+                status_code=401,
+                detail="请先登录",
+                headers={"WWW-Authenticate": "Session"},
+            ) from err
+
+    async def require_auth_csrf(
+        request: Request,
+        context: AuthContext = Depends(require_auth),
+        csrf_header: Optional[str] = Header(default=None, alias="X-CSRF-Token"),
+    ) -> AuthContext:
+        csrf_cookie = request.cookies.get(_CSRF_COOKIE, "")
+        if not container().auth_service.verify_csrf(context, csrf_header or "", csrf_cookie):
+            raise HTTPException(status_code=403, detail="CSRF 校验失败")
+        return context
+
+    async def session_for_user(session_id: str, context: AuthContext) -> Optional[dict]:
+        session = await container().conversation_store.find_session(session_id)
+        if session is None or session.get("deleted_at") or session.get("buyer_id") != context.user.user_id:
+            return None
+        return session
+
+    async def claim_session_for_user(
+        session_id: str,
+        context: AuthContext,
+        locale: str,
+        currency: str,
+    ) -> None:
+        """校验已有会话 owner；新会话先绑定 owner，再允许执行业务。"""
+        async with state.setdefault("session_claim_lock", asyncio.Lock()):
+            existing = await container().conversation_store.find_session(session_id)
+            if existing is not None:
+                if existing.get("deleted_at") or existing.get("buyer_id") != context.user.user_id:
+                    raise HTTPException(status_code=404, detail="会话不存在")
+                return
+            await container().conversation_store.touch_session(
+                session_id, context.user.user_id, locale, currency,
+            )
+            claimed = await container().conversation_store.find_session(session_id)
+            if claimed is None or claimed.get("buyer_id") != context.user.user_id:
+                raise HTTPException(status_code=404, detail="会话不存在")
+
+    async def generation_for_user(generation_id: str, context: AuthContext) -> Generation:
+        generation = await container().generation_store.get(generation_id)
+        if generation is None or generation.buyer_id != context.user.user_id:
+            raise HTTPException(status_code=404, detail="generation 不存在")
+        return generation
+
+    async def login_rate_limited(request: Request, email: str) -> bool:
+        identity = f"{request.client.host if request.client else 'unknown'}:{email.strip().lower()}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        c = container()
+        if c.cache.enabled:
+            try:
+                key = f"globex:auth:login:{digest}"
+                count = int(await c.cache.client.incr(key))
+                if count == 1:
+                    await c.cache.client.expire(key, _LOGIN_WINDOW_SECONDS)
+                return count > _LOGIN_ATTEMPT_LIMIT
+            except Exception as err:  # noqa: BLE001
+                # Redis 是共享限流器，不是登录可用性的单点。异常时退回当前进程限流，
+                # 仍保留基础防爆破能力，并把降级记录到日志中。
+                logger.warning("登录限流 Redis 不可用，退回进程内限流：%s", err)
+        now = time.monotonic()
+        buckets = state.setdefault("login_attempts", {})
+        # 普通 dict 保留插入顺序。每次访问先取出再放回，让最久没活动的桶位于最前；
+        # 达到上限时淘汰旧桶，避免攻击者用大量随机邮箱把进程内存无限撑大。
+        attempts = buckets.pop(digest, [])
+        attempts[:] = [value for value in attempts if now - value < _LOGIN_WINDOW_SECONDS]
+        attempts.append(now)
+        buckets[digest] = attempts
+        while len(buckets) > _LOCAL_LOGIN_BUCKET_LIMIT:
+            buckets.pop(next(iter(buckets)))
+        return len(attempts) > _LOGIN_ATTEMPT_LIMIT
+
+    async def clear_login_attempts(request: Request, email: str) -> None:
+        identity = f"{request.client.host if request.client else 'unknown'}:{email.strip().lower()}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        c = container()
+        if c.cache.enabled:
+            try:
+                await c.cache.client.delete(f"globex:auth:login:{digest}")
+            except Exception as err:  # noqa: BLE001
+                logger.warning("清理 Redis 登录限流记录失败：%s", err)
+        state.setdefault("login_attempts", {}).pop(digest, None)
+
     settings_origins = build_container_origins()
     api.add_middleware(
         CORSMiddleware,
@@ -205,6 +334,58 @@ def build_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @api.post("/auth/register", response_model=CurrentUserOut, status_code=201)
+    async def register(body: RegisterRequest, response: Response) -> CurrentUserOut:
+        try:
+            issued = await container().auth_service.register(
+                body.email, body.display_name, body.password,
+            )
+        except EmailAlreadyExists as err:
+            raise HTTPException(status_code=409, detail=str(err)) from err
+        except AuthError as err:
+            raise HTTPException(status_code=422, detail=str(err)) from err
+        set_auth_cookies(response, issued)
+        return CurrentUserOut(
+            user_id=issued.user.user_id,
+            email=issued.user.email,
+            display_name=issued.user.display_name,
+        )
+
+    @api.post("/auth/login", response_model=CurrentUserOut)
+    async def login(body: LoginRequest, request: Request, response: Response) -> CurrentUserOut:
+        if await login_rate_limited(request, body.email):
+            raise HTTPException(status_code=429, detail="登录尝试过于频繁，请稍后再试")
+        try:
+            issued = await container().auth_service.login(body.email, body.password)
+        except AuthError as err:
+            raise HTTPException(status_code=401, detail="邮箱或密码错误") from err
+        await clear_login_attempts(request, body.email)
+        set_auth_cookies(response, issued)
+        return CurrentUserOut(
+            user_id=issued.user.user_id,
+            email=issued.user.email,
+            display_name=issued.user.display_name,
+        )
+
+    @api.get("/auth/me", response_model=CurrentUserOut)
+    async def me(
+        response: Response,
+        context: AuthContext = Depends(require_auth),
+    ) -> CurrentUserOut:
+        response.headers["Cache-Control"] = "no-store"
+        return current_user_out(context)
+
+    @api.post("/auth/logout", status_code=204)
+    async def logout(
+        request: Request,
+        response: Response,
+        _: AuthContext = Depends(require_auth_csrf),
+    ) -> Response:
+        await container().auth_service.logout(request.cookies.get(_SESSION_COOKIE, ""))
+        clear_auth_cookies(response)
+        response.status_code = 204
+        return response
 
     @api.get("/health")
     async def health() -> dict:
@@ -232,12 +413,16 @@ def build_app() -> FastAPI:
         }
 
     @api.post("/commerce/intents", response_model=SubmitIntentResponse)
-    async def submit_intent(body: SubmitIntentRequest) -> SubmitIntentResponse:
+    async def submit_intent(
+        body: SubmitIntentRequest,
+        context: AuthContext = Depends(require_auth_csrf),
+    ) -> SubmitIntentResponse:
         c = container()
         session_id = body.shopping_session_id or f"session-{uuid.uuid4().hex[:8]}"
+        await claim_session_for_user(session_id, context, body.locale, body.currency)
         intent = SubmitIntentInput(
             shopping_session_id=session_id,
-            buyer_id=body.buyer_id,
+            buyer_id=context.user.user_id,
             locale=body.locale,
             currency=body.currency,
             raw_query=body.raw_query,
@@ -253,30 +438,41 @@ def build_app() -> FastAPI:
         return SubmitIntentResponse(shopping_session_id=session_id, final_text=final_text)
 
     @api.post("/commerce/intents/async")
-    async def submit_intent_async(body: SubmitIntentRequest) -> dict:
+    async def submit_intent_async(
+        body: SubmitIntentRequest,
+        context: AuthContext = Depends(require_auth_csrf),
+    ) -> dict:
         c = container()
+        if c.task_queue is None:
+            # 先确认能力可用，再认领/创建会话，避免 503 请求留下空会话。
+            raise HTTPException(status_code=503, detail="队列未启用，请使用 /commerce/intents")
         session_id = body.shopping_session_id or f"session-{uuid.uuid4().hex[:8]}"
+        await claim_session_for_user(session_id, context, body.locale, body.currency)
         intent = SubmitIntentInput(
             shopping_session_id=session_id,
-            buyer_id=body.buyer_id,
+            buyer_id=context.user.user_id,
             locale=body.locale,
             currency=body.currency,
             raw_query=body.raw_query,
         )
-        if c.task_queue is None:
-            raise HTTPException(status_code=503, detail="队列未启用，请使用 /commerce/intents")
         task_id = await _enqueue(c, intent)
         return {"shopping_session_id": session_id, "task_id": task_id, "state": "queued"}
 
     @api.post("/commerce/sessions/{session_id}/generations", response_model=GenerationOut)
-    async def create_generation(session_id: str, body: CreateGenerationRequest) -> GenerationOut:
+    async def create_generation(
+        session_id: str,
+        body: CreateGenerationRequest,
+        context: AuthContext = Depends(require_auth_csrf),
+    ) -> GenerationOut:
         """幂等创建一次运行。SSE 订阅另走 generation 事件端点。"""
         c = container()
+        buyer_id = context.user.user_id
         # 同一 API 进程内串行完成“幂等创建 + 配额判断”，避免重复请求被 429 拒绝。
         async with state.setdefault("generation_create_lock", asyncio.Lock()):
+            await claim_session_for_user(session_id, context, body.locale, body.currency)
             generation = Generation(
                 generation_id=f"gen-{uuid.uuid4().hex}", session_id=session_id,
-                buyer_id=body.buyer_id, request_id=body.request_id, status="queued",
+                buyer_id=buyer_id, request_id=body.request_id, status="queued",
             )
             saved, created = await c.generation_store.create_or_get(generation)
             if not created:
@@ -288,7 +484,7 @@ def build_app() -> FastAPI:
                     error_code="session_generation_in_progress",
                 )
                 raise HTTPException(status_code=409, detail="session_generation_in_progress")
-            if await c.generation_store.count_active(body.buyer_id) > 3:
+            if await c.generation_store.count_active(buyer_id) > 3:
                 await c.generation_store.transition(
                     generation.generation_id, ("queued",), "failed",
                     error_code="generation_limit_reached",
@@ -300,32 +496,39 @@ def build_app() -> FastAPI:
                 generation.generation_id, "user.message", {"text": body.raw_query},
                 datetime.now(timezone.utc).isoformat(),
             )
-        await c.conversation_store.touch_session(session_id, body.buyer_id, body.locale, body.currency)
+        await c.conversation_store.touch_session(session_id, buyer_id, body.locale, body.currency)
         if c.task_queue is not None:
             await _enqueue(c, SubmitIntentInput(
-                shopping_session_id=session_id, buyer_id=body.buyer_id, locale=body.locale,
+                shopping_session_id=session_id, buyer_id=buyer_id, locale=body.locale,
                 currency=body.currency, raw_query=body.raw_query,
             ), generation_id=generation.generation_id)
             return generation_out(generation)
         task = asyncio.create_task(run_generation(c, generation.generation_id, SubmitIntentInput(
-            shopping_session_id=session_id, buyer_id=body.buyer_id, locale=body.locale,
+            shopping_session_id=session_id, buyer_id=buyer_id, locale=body.locale,
             currency=body.currency, raw_query=body.raw_query,
         )))
         state.setdefault("generation_tasks", {})[generation.generation_id] = task
         return generation_out(generation)
 
     @api.get("/commerce/generations/{generation_id}", response_model=GenerationOut)
-    async def get_generation(generation_id: str) -> GenerationOut:
-        generation = await container().generation_store.get(generation_id)
-        if generation is None:
-            raise HTTPException(status_code=404, detail="generation 不存在")
+    async def get_generation(
+        generation_id: str,
+        context: AuthContext = Depends(require_auth),
+    ) -> GenerationOut:
+        generation = await generation_for_user(generation_id, context)
         return generation_out(generation)
 
     @api.get("/commerce/sessions/{session_id}/generations/latest", response_model=GenerationOut)
-    async def latest_active_generation(session_id: str) -> GenerationOut:
+    async def latest_active_generation(
+        session_id: str,
+        context: AuthContext = Depends(require_auth),
+    ) -> GenerationOut:
         """刷新恢复入口：只返回该会话仍未终态的一次运行。"""
         c = container()
+        if await session_for_user(session_id, context) is None:
+            raise HTTPException(status_code=404, detail="没有活跃 generation")
         active = await c.generation_store.list_active_for_session(session_id)
+        active = [item for item in active if item.buyer_id == context.user.user_id]
         if not active:
             raise HTTPException(status_code=404, detail="没有活跃 generation")
         latest = active[-1]
@@ -340,8 +543,12 @@ def build_app() -> FastAPI:
         return generation_out(latest)
 
     @api.delete("/commerce/generations/{generation_id}", response_model=GenerationOut)
-    async def cancel_generation(generation_id: str) -> GenerationOut:
+    async def cancel_generation(
+        generation_id: str,
+        context: AuthContext = Depends(require_auth_csrf),
+    ) -> GenerationOut:
         c = container()
+        await generation_for_user(generation_id, context)
         generation = await c.generation_store.request_cancel(generation_id)
         if generation is None:
             raise HTTPException(status_code=404, detail="generation 不存在")
@@ -355,10 +562,10 @@ def build_app() -> FastAPI:
         generation_id: str,
         after_seq: Optional[int] = None,
         last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+        context: AuthContext = Depends(require_auth),
     ) -> StreamingResponse:
         c = container()
-        if await c.generation_store.get(generation_id) is None:
-            raise HTTPException(status_code=404, detail="generation 不存在")
+        await generation_for_user(generation_id, context)
         if after_seq is not None and after_seq < 0:
             raise HTTPException(status_code=400, detail="after_seq 必须是非负整数")
         header_seq: Optional[int] = None
@@ -395,12 +602,17 @@ def build_app() -> FastAPI:
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
     @api.get("/commerce/tasks/{task_id}")
-    async def get_task(task_id: str) -> dict:
+    async def get_task(
+        task_id: str,
+        context: AuthContext = Depends(require_auth),
+    ) -> dict:
         c = container()
         if c.task_queue is None:
             raise HTTPException(status_code=503, detail="队列未启用")
         status = await c.task_queue.get_status(task_id)
         if status is None:
+            raise HTTPException(status_code=404, detail=f"任务不存在或已过期：{task_id}")
+        if status.buyer_id != context.user.user_id:
             raise HTTPException(status_code=404, detail=f"任务不存在或已过期：{task_id}")
         return {
             "task_id": status.task_id,
@@ -412,29 +624,56 @@ def build_app() -> FastAPI:
 
     @api.websocket("/commerce/events")
     async def commerce_events(websocket: WebSocket) -> None:
-        await state["connections"].serve(websocket)
+        try:
+            context = await container().auth_service.resolve(
+                websocket.cookies.get(_SESSION_COOKIE, ""),
+            )
+        except AuthError:
+            await websocket.close(code=4401, reason="请先登录")
+            return
+        await state["connections"].serve(
+            websocket, context.user.user_id, container().conversation_store,
+        )
 
     @api.get("/commerce/orders/{order_id}")
-    async def get_order(order_id: str) -> dict:
+    async def get_order(
+        order_id: str,
+        context: AuthContext = Depends(require_auth),
+    ) -> dict:
         try:
-            return await container().query_order.execute(order_id)
+            order = await container().query_order.execute(order_id)
         except ValueError as err:
             raise HTTPException(status_code=404, detail=str(err)) from err
+        if order.get("buyer_id") != context.user.user_id:
+            raise HTTPException(status_code=404, detail=f"订单不存在：{order_id}")
+        return order
 
     @api.post("/commerce/orders/{order_id}/cancel")
-    async def cancel_order_endpoint(order_id: str, body: CancelOrderRequest) -> dict:
+    async def cancel_order_endpoint(
+        order_id: str,
+        body: CancelOrderRequest,
+        context: AuthContext = Depends(require_auth_csrf),
+    ) -> dict:
         try:
+            order = await container().query_order.execute(order_id)
+            if order.get("buyer_id") != context.user.user_id:
+                raise HTTPException(status_code=404, detail=f"订单不存在：{order_id}")
             return await container().cancel_order.execute(order_id, body.reason)
+        except HTTPException:
+            raise
         except ValueError as err:
             raise HTTPException(status_code=400, detail=str(err)) from err
 
     # ===== F3 会话管理（服务端为真相源的读写入口）=====
 
     @api.get("/commerce/sessions", response_model=list[SessionSummaryOut])
-    async def list_sessions(buyer_id: str, limit: int = 50) -> list[SessionSummaryOut]:
+    async def list_sessions(
+        limit: int = 50,
+        context: AuthContext = Depends(require_auth),
+    ) -> list[SessionSummaryOut]:
         """买家会话列表：排除软删、按最近活跃倒序（侧边栏数据源）。"""
         summaries = await container().conversation_store.list_sessions(
-            buyer_id=buyer_id,
+            buyer_id=context.user.user_id,
             limit=max(1, min(limit, 200)),
         )
         return [
@@ -448,10 +687,14 @@ def build_app() -> FastAPI:
         ]
 
     @api.get("/commerce/sessions/{session_id}/turns", response_model=list[TurnOut])
-    async def session_turns(session_id: str, limit: int = 200) -> list[TurnOut]:
+    async def session_turns(
+        session_id: str,
+        limit: int = 200,
+        context: AuthContext = Depends(require_auth),
+    ) -> list[TurnOut]:
         """会话已定型消息（每轮轮末写入）。正在流的当轮不在其中。"""
-        session = await container().conversation_store.find_session(session_id)
-        if session is None or session.get("deleted_at"):
+        session = await session_for_user(session_id, context)
+        if session is None:
             raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
         turns = await container().conversation_store.list_turns(
             session_id, limit=max(1, min(limit, 500)),
@@ -462,11 +705,17 @@ def build_app() -> FastAPI:
         ]
 
     @api.patch("/commerce/sessions/{session_id}", response_model=SessionSummaryOut)
-    async def rename_session(session_id: str, body: RenameSessionRequest) -> SessionSummaryOut:
+    async def rename_session(
+        session_id: str,
+        body: RenameSessionRequest,
+        context: AuthContext = Depends(require_auth_csrf),
+    ) -> SessionSummaryOut:
         """用户重命名：置 title_custom=True，之后异步语义标题不再覆盖。"""
         title = body.title.strip()
         if not title:
             raise HTTPException(status_code=422, detail="标题不能为空")
+        if await session_for_user(session_id, context) is None:
+            raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
         if not await container().conversation_store.rename_session(session_id, title):
             raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
         session = await container().conversation_store.find_session(session_id) or {}
@@ -478,10 +727,17 @@ def build_app() -> FastAPI:
         )
 
     @api.delete("/commerce/sessions/{session_id}")
-    async def delete_session(session_id: str) -> dict:
+    async def delete_session(
+        session_id: str,
+        context: AuthContext = Depends(require_auth_csrf),
+    ) -> dict:
         """软删：写 deleted_at，messages/events 仍保留（badcase 数据底座）。"""
         c = container()
+        if await session_for_user(session_id, context) is None:
+            raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
         for generation in await c.generation_store.list_active_for_session(session_id):
+            if generation.buyer_id != context.user.user_id:
+                continue
             await c.generation_store.request_cancel(generation.generation_id)
             task = state.get("generation_tasks", {}).get(generation.generation_id)
             if task is not None:
@@ -542,7 +798,9 @@ async def _enqueue(c: Container, intent: SubmitIntentInput, generation_id: str =
             priority=await _queue_priority(c, intent.shopping_session_id),
         ),
     )
-    await c.task_queue.set_status(TaskStatus(task_id=task_id, state="queued"))  # type: ignore[union-attr]
+    await c.task_queue.set_status(  # type: ignore[union-attr]
+        TaskStatus(task_id=task_id, state="queued", buyer_id=intent.buyer_id),
+    )
     c.bus.publish(intent.shopping_session_id, "task.queued", {"task_id": task_id})
     return task_id
 

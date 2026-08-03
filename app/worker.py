@@ -68,7 +68,7 @@ async def main() -> None:
             await container.generation_store.transition(
                 task.generation_id, ("queued",), "running",
             )
-        await container.task_queue.set_status(TaskStatus(task_id=task.task_id, state="running"))
+        await container.task_queue.set_status(TaskStatus(task_id=task.task_id, state="running", buyer_id=task.buyer_id))
         container.bus.publish(task.shopping_session_id, "task.started", {"task_id": task.task_id})
         queue = container.bus.subscribe(task.shopping_session_id) if task.generation_id else None
 
@@ -123,7 +123,7 @@ async def main() -> None:
                             task.generation_id, ("cancelling",), "cancelled",
                         )
                     await container.task_queue.set_status(
-                        TaskStatus(task_id=task.task_id, state="cancelled"),
+                        TaskStatus(task_id=task.task_id, state="cancelled", buyer_id=task.buyer_id),
                     )
                     return
                 if result.final_text.startswith("[error]"):
@@ -135,7 +135,7 @@ async def main() -> None:
                         task.generation_id, ("running",), "failed", error_code="agent_error",
                     )
                     await container.task_queue.set_status(
-                        TaskStatus(task_id=task.task_id, state="failed", error=result.final_text),
+                        TaskStatus(task_id=task.task_id, state="failed", buyer_id=task.buyer_id, error=result.final_text),
                     )
                 else:
                     await container.generation_store.append_event(
@@ -146,11 +146,11 @@ async def main() -> None:
                         task.generation_id, ("running",), "completed", final_text=result.final_text,
                     )
                     await container.task_queue.set_status(
-                        TaskStatus(task_id=task.task_id, state="done", final_text=result.final_text),
+                        TaskStatus(task_id=task.task_id, state="done", buyer_id=task.buyer_id, final_text=result.final_text),
                     )
             else:
                 await container.task_queue.set_status(
-                    TaskStatus(task_id=task.task_id, state="done", final_text=result.final_text),
+                    TaskStatus(task_id=task.task_id, state="done", buyer_id=task.buyer_id, final_text=result.final_text),
                 )
         except asyncio.CancelledError:
             if task.generation_id:
@@ -161,11 +161,11 @@ async def main() -> None:
                     task.generation_id, ("queued", "running", "cancelling"), "cancelled",
                 )
                 await container.task_queue.set_status(
-                    TaskStatus(task_id=task.task_id, state="cancelled"),
+                    TaskStatus(task_id=task.task_id, state="cancelled", buyer_id=task.buyer_id),
                 )
         except Exception as err:  # noqa: BLE001 —— 标记失败后抛出，交给队列决定重投或死信
             await container.task_queue.set_status(
-                TaskStatus(task_id=task.task_id, state="failed", error=str(err)),
+                TaskStatus(task_id=task.task_id, state="failed", buyer_id=task.buyer_id, error=str(err)),
             )
             if task.generation_id:
                 await container.generation_store.append_event(

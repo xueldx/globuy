@@ -21,6 +21,7 @@ from app.application.agents.main_agent import MainAgentFactory, SessionRegistry
 from app.application.agents.orchestrator import MainAgentOrchestrator
 from app.application.agents.search_agent import SearchAgentFactory
 from app.application.agents.trade_agent import TradeAgentFactory
+from app.application.auth.service import AuthService
 from app.application.harness.assertions import SequencingTracker
 from app.application.harness.drift_detector import DriftDetector
 from app.application.harness.loop_detector import LoopDetector
@@ -51,6 +52,8 @@ from app.infrastructure.persistence.json_file_stores import (
     JsonFileSessionStore,
 )
 from app.infrastructure.persistence.json_generation_store import JsonGenerationStore
+from app.infrastructure.persistence.json_auth_store import JsonAuthStore
+from app.infrastructure.persistence.sql.auth_store import SqlAuthStore
 from app.infrastructure.persistence.sql.generation_store import SqlGenerationStore
 from app.infrastructure.persistence.sql.repositories import (
     SqlConversationStore,
@@ -111,6 +114,7 @@ class Container:
     vector_index: QdrantProductIndex
     knowledge_base: Any
     db_engine: Any
+    auth_service: AuthService
 
     async def startup(self) -> None:
         """建表（迁移）/ 建向量库 / 建知识库。任一失败只告警，对应能力降级但服务可用。"""
@@ -193,6 +197,7 @@ async def build_container() -> Container:
         session_store = SqlSessionStore(db_engine)
         conversation_store = SqlConversationStore(db_engine)
         generation_store = SqlGenerationStore(db_engine)
+        auth_store = SqlAuthStore(db_engine)
         logger.info("持久化形态：%s", db_engine.url.get_backend_name())
     else:
         order_repo = InMemoryOrderRepository()
@@ -200,6 +205,7 @@ async def build_container() -> Container:
         session_store = JsonFileSessionStore(settings.data_dir)
         conversation_store = JsonFileConversationStore(settings.data_dir)
         generation_store = JsonGenerationStore(settings.data_dir)
+        auth_store = JsonAuthStore(settings.data_dir)
         logger.info("持久化形态：本地 JSON 文件（DATABASE_URL=file）")
 
     # 熔断注册表：开 BREAKER_SHARED 且 Redis 可用时跨实例共享，否则进程内
@@ -285,4 +291,5 @@ async def build_container() -> Container:
         vector_index=vector_index,
         knowledge_base=knowledge_base,
         db_engine=db_engine,
+        auth_service=AuthService(auth_store, settings.auth_session_ttl_seconds),
     )

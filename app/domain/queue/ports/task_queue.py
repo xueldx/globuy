@@ -67,6 +67,7 @@ class IntentTask:
 class TaskStatus:
     task_id: str
     state: str  # queued / running / done / failed
+    buyer_id: str = ""
     final_text: str = ""
     error: str = ""
     queue_position: int = 0

@@ -56,6 +56,7 @@ class RedisStreamTaskQueue(TaskQueue):
                 {
                     "task_id": status.task_id,
                     "state": status.state,
+                    "buyer_id": status.buyer_id,
                     "final_text": status.final_text,
                     "error": status.error,
                 },
@@ -73,6 +74,7 @@ class RedisStreamTaskQueue(TaskQueue):
         return TaskStatus(
             task_id=data["task_id"],
             state=data["state"],
+            buyer_id=data.get("buyer_id", ""),
             final_text=data.get("final_text", ""),
             error=data.get("error", ""),
             queue_position=position,

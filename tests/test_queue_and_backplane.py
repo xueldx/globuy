@@ -105,9 +105,10 @@ class TestEnqueueAndStatus:
         await queue.enqueue(_task())
         assert len(client.entries) == 1
 
-        await queue.set_status(TaskStatus(task_id="task-1", state="queued"))
+        await queue.set_status(TaskStatus(task_id="task-1", state="queued", buyer_id="buyer-1"))
         status = await queue.get_status("task-1")
         assert status is not None and status.state == "queued"
+        assert status.buyer_id == "buyer-1"
 
     async def test_done_status_carries_final_text(self):
         queue = RedisStreamTaskQueue(FakeStreamClient())

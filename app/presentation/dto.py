@@ -7,12 +7,15 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SubmitIntentRequest(BaseModel):
+    # 旧客户端曾自行提交 buyer_id。显式拒绝未知字段，可以尽早暴露旧协议，
+    # 也避免以后误把“客户端声称的身份”重新带回服务端。
+    model_config = ConfigDict(extra="forbid")
+
     shopping_session_id: Optional[str] = Field(default=None, description="会话 ID，缺省则新建会话")
-    buyer_id: str = Field(min_length=1, description="买家 ID")
     locale: str = Field(default="zh-CN")
     currency: str = Field(default="CNY")
     raw_query: str = Field(min_length=1, description="买家自然语言购物意图")
@@ -61,3 +64,26 @@ class GenerationOut(BaseModel):
     last_event_seq: int = 0
     final_text: str = ""
     error_code: str = ""
+
+
+# ---- 登录与当前用户 ----
+
+class RegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=254)
+    display_name: str = Field(min_length=1, max_length=40)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=1, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class CurrentUserOut(BaseModel):
+    user_id: str
+    email: str
+    display_name: str

@@ -14,6 +14,7 @@ from dataclasses import asdict
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.infrastructure.eventbus import TradeEventBus
+from app.domain.session.ports.conversation_store import ConversationStore
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,12 @@ class ConnectionManager:
     def __init__(self, bus: TradeEventBus) -> None:
         self._bus = bus
 
-    async def serve(self, websocket: WebSocket) -> None:
+    async def serve(
+        self,
+        websocket: WebSocket,
+        buyer_id: str,
+        conversation_store: ConversationStore,
+    ) -> None:
         await websocket.accept()
         try:
             subscribe_payload = await websocket.receive_json()
@@ -31,6 +37,10 @@ class ConnectionManager:
         session_id = subscribe_payload.get("shopping_session_id")
         if not session_id:
             await websocket.close(code=4000, reason="缺少 shopping_session_id")
+            return
+        session = await conversation_store.find_session(session_id)
+        if session is None or session.get("deleted_at") or session.get("buyer_id") != buyer_id:
+            await websocket.close(code=4404, reason="会话不存在")
             return
 
         queue = self._bus.subscribe(session_id)
