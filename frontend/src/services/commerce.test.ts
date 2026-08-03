@@ -69,7 +69,6 @@ describe("generation SSE service", () => {
     vi.useFakeTimers();
     const payload = {
       request_id: "req-1",
-      buyer_id: "buyer-1",
       locale: "zh-CN",
       currency: "CNY",
       raw_query: "hello",
@@ -86,5 +85,7 @@ describe("generation SSE service", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls[0][1]?.body).toBe(fetchMock.mock.calls[1][1]?.body);
     expect(fetchMock.mock.calls[0][1]?.body).toContain('"request_id":"req-1"');
+    expect(fetchMock.mock.calls[0][1]?.body).not.toContain("buyer_id");
+    expect(fetchMock.mock.calls[0][1]?.credentials).toBe("include");
   });
 });

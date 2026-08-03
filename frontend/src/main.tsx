@@ -7,12 +7,22 @@ import { router } from "./router";
 import { useThemeStore } from "./stores/themeStore";
 import "streamdown/styles.css";
 import "./index.css";
+import { useEffect } from "react";
+import { useAuthStore } from "./stores/authStore";
 
 // 防御性双保险：确保主题一定在首帧前落 DOM（幂等，重复调用无副作用）
 useThemeStore.getState().initialize();
 
+function App() {
+  const bootstrap = useAuthStore((state) => state.bootstrap);
+  useEffect(() => {
+    void bootstrap().catch(() => undefined);
+  }, [bootstrap]);
+  return <RouterProvider router={router} />;
+}
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <RouterProvider router={router} />
+    <App />
   </React.StrictMode>,
 );

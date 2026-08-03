@@ -23,7 +23,35 @@ export interface RequestOptions {
   timeoutMs?: number;
 }
 
-export const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
+export const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
+
+let unauthorizedHandler: (() => void) | undefined;
+
+export function setUnauthorizedHandler(handler: (() => void) | undefined): void {
+  unauthorizedHandler = handler;
+}
+
+export function notifyUnauthorized(): void {
+  unauthorizedHandler?.();
+}
+
+function cookieValue(name: string): string {
+  if (typeof document === "undefined") return "";
+  const prefix = `${encodeURIComponent(name)}=`;
+  const item = document.cookie.split("; ").find((part) => part.startsWith(prefix));
+  return item ? decodeURIComponent(item.slice(prefix.length)) : "";
+}
+
+async function errorMessage(response: Response): Promise<string> {
+  const text = await response.text().catch(() => "");
+  if (!text) return `请求失败（${response.status}）`;
+  try {
+    const body = JSON.parse(text) as { detail?: unknown };
+    return typeof body.detail === "string" ? body.detail : text;
+  } catch {
+    return text;
+  }
+}
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = "GET", body, signal, timeoutMs = 15_000 } = options;
@@ -33,16 +61,21 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   signal?.addEventListener("abort", onAbort);
 
   try {
+    const csrf = method === "GET" ? "" : cookieValue("globuy_csrf");
     const res = await fetch(`${API_BASE}${path}`, {
       method,
-      headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      credentials: "include",
+      headers: {
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...(csrf ? { "X-CSRF-Token": csrf } : {}),
+      },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
 
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new ApiError(res.status, text || `请求失败（${res.status}）`);
+      if (res.status === 401 && path !== "/auth/login") notifyUnauthorized();
+      throw new ApiError(res.status, await errorMessage(res));
     }
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;

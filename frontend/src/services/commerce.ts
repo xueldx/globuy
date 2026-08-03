@@ -5,14 +5,10 @@ import type { GenerationSummary, SessionSummary, SessionTurn } from "@/types";
 /** 意图提交协议。旧同步接口仍使用它，generation 创建会额外携带 request_id。 */
 export interface IntentPayload {
   shopping_session_id: string;
-  buyer_id: string;
   locale: string;
   currency: string;
   raw_query: string;
 }
-
-/** F3 无登录态，前后端以固定买家身份跑（服务端按 buyer_id 隔离会话）。 */
-export const DEMO_BUYER_ID = "demo-buyer";
 
 /** 会话历史轮数默认上限，与服务端限长对齐 */
 export const TURNS_LIMIT = 200;
@@ -178,9 +174,9 @@ export function fetchLatestGeneration(sessionId: string) {
 // ===== F3 会话管理（服务端为真相源：列表 / 历史 / 重命名 / 软删）=====
 
 /** 会话列表（软删已排除、按最近活跃倒序）。 */
-export function listSessions(buyerId: string = DEMO_BUYER_ID, limit: number = SESSIONS_LIMIT) {
+export function listSessions(limit: number = SESSIONS_LIMIT) {
   return request<SessionSummary[]>(
-    `/commerce/sessions?buyer_id=${encodeURIComponent(buyerId)}&limit=${limit}`,
+    `/commerce/sessions?limit=${limit}`,
   );
 }
 

@@ -3,7 +3,6 @@ import type { ChatMessage, ChatMessageStatus, SessionSummary, SessionTurn, Trade
 import { ApiError } from "@/lib/api";
 import { createRafTextBuffer } from "@/lib/rafTextBuffer";
 import {
-  DEMO_BUYER_ID,
   deleteSession as apiDeleteSession,
   fetchTurns,
   fetchLatestGeneration,
@@ -58,6 +57,10 @@ export interface ChatState {
    *  失败回滚列表返回 false。后端删除接口会先持久化取消请求，再执行软删。 */
   deleteSession: (sessionId: string) => Promise<boolean>;
   dismissNotice: () => void;
+  /** 主动退出或切换账户时中止订阅并清空上一用户数据。 */
+  resetForLogout: () => void;
+  /** 登录失效时暂停流，但保留页面快照，供同一账户重新登录后恢复。 */
+  pauseForAuth: () => void;
 }
 
 /** 并发 generation 上限：前端提前提示，服务端仍会独立校验。 */
@@ -168,12 +171,51 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     dismissNotice: () => set({ notice: null }),
 
+    resetForLogout: () => {
+      activeStreams.forEach((controller) => controller.abort());
+      activeStreams.clear();
+      activeGenerations.clear();
+      pendingCancels.clear();
+      deletingIds.clear();
+      useAgentProcessStore.getState().reset();
+      set({
+        sessions: [],
+        sessionsLoaded: false,
+        sessionsLoading: false,
+        sessionsFailed: false,
+        currentSessionId: null,
+        messagesBySession: {},
+        streamingMsgIdBySession: {},
+        streamingBySession: {},
+        statusBySession: {},
+        loadingBySession: {},
+        notice: null,
+      });
+    },
+
+    pauseForAuth: () => {
+      activeStreams.forEach((controller) => controller.abort());
+      activeStreams.clear();
+      activeGenerations.clear();
+      pendingCancels.clear();
+      set({
+        sessionsLoaded: false,
+        sessionsLoading: false,
+        currentSessionId: null,
+        streamingMsgIdBySession: {},
+        streamingBySession: {},
+        statusBySession: {},
+        loadingBySession: {},
+        notice: null,
+      });
+    },
+
     setCurrentSession: (id) => set({ currentSessionId: id }),
 
     loadSessions: async () => {
       set({ sessionsLoading: true });
       try {
-        const server = await listSessions(DEMO_BUYER_ID);
+        const server = await listSessions();
         // 合并策略：服务端列表是真相源，但保留「还没被服务端收录」的本地会话
         //（刚发首轮、流还没走完持久化的新会话）——否则刷新会把正在聊的会话刷没。
         const g = get();
@@ -412,7 +454,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       try {
         const generation = await createGeneration(sid, {
             request_id: makeId("req"),
-            buyer_id: DEMO_BUYER_ID,
             locale: "zh-CN",
             currency: "CNY",
             raw_query: query,

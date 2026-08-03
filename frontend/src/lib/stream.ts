@@ -1,4 +1,4 @@
-import { API_BASE } from "./api";
+import { API_BASE, notifyUnauthorized } from "./api";
 
 /** 传输层解析后的标准 SSE 事件。data 保持原始文本，由业务层决定如何反序列化。 */
 export interface SSEMessage {
@@ -160,10 +160,12 @@ export interface SubscribeSSEOptions {
 export async function subscribeSSE(options: SubscribeSSEOptions): Promise<void> {
   const response = await fetch(`${API_BASE}${options.url}`, {
     method: "GET",
+    credentials: "include",
     headers: { Accept: "text/event-stream", ...options.headers },
     signal: options.signal,
   });
   if (!response.ok) {
+    if (response.status === 401) notifyUnauthorized();
     const detail = await response.text().catch(() => "");
     throw new SSEHttpError(response.status, detail || `SSE 订阅失败（${response.status}）`);
   }

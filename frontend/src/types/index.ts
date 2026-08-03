@@ -85,3 +85,11 @@ export interface GenerationSummary {
   final_text: string;
   error_code: string;
 }
+
+// ===== 登录用户 =====
+
+export interface CurrentUser {
+  user_id: string;
+  email: string;
+  display_name: string;
+}

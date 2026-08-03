@@ -1,5 +1,7 @@
 import { createBrowserRouter } from "react-router-dom";
 import MainLayout from "./layouts/MainLayout";
+import { GuestOnly, RequireAuth } from "./components/auth/AuthGuard";
+import { LoginPage, RegisterPage } from "./pages/auth/AuthPage";
 
 /**
  * createBrowserRouter + 路由级 lazy（RR6 约定：页面模块导出命名 `Component`）。
@@ -7,8 +9,16 @@ import MainLayout from "./layouts/MainLayout";
  */
 export const router = createBrowserRouter([
   {
+    path: "/login",
+    element: <GuestOnly><LoginPage /></GuestOnly>,
+  },
+  {
+    path: "/register",
+    element: <GuestOnly><RegisterPage /></GuestOnly>,
+  },
+  {
     path: "/",
-    element: <MainLayout />,
+    element: <RequireAuth><MainLayout /></RequireAuth>,
     children: [
       { index: true, lazy: () => import("./pages/welcome/WelcomePage") },
       { path: "chat", lazy: () => import("./pages/chat/ChatPage") },
