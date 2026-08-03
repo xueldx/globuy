@@ -44,6 +44,33 @@ class Base(DeclarativeBase):
     pass
 
 
+class AuthUserRow(Base):
+    """登录账户。密码字段只保存 Argon2 哈希。"""
+
+    __tablename__ = "auth_users"
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(40))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuthSessionRow(Base):
+    """可撤销登录 Session。原始 Token 和 CSRF Token 均不落库。"""
+
+    __tablename__ = "auth_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), ForeignKey("auth_users.user_id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    csrf_token_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ConversationSessionRow(Base):
     __tablename__ = "conversation_sessions"
 

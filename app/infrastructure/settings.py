@@ -86,6 +86,9 @@ class Settings:
     preference_subagent_inject: bool = True  # 给检索子 Agent 注入偏好（纯本地拼装，零成本）
     queue_priority_enabled: bool = True  # 双队列优先级（无 Redis 时自动无效）
     queue_large_request_turns: int = 30  # 对话轮数 >= 此值走大请求队列
+    # ---- 登录 Session ----
+    auth_session_ttl_seconds: int = 604800  # 固定 7 天，不做“记住我”多档期限
+    auth_cookie_secure: bool = False  # 生产 HTTPS 必须显式开启
 
 
 def load_settings() -> Settings:
@@ -160,4 +163,6 @@ def load_settings() -> Settings:
         not in ("0", "false", "False"),
         queue_priority_enabled=os.getenv("QUEUE_PRIORITY_ENABLED", "1") not in ("0", "false", "False"),
         queue_large_request_turns=int(os.getenv("QUEUE_LARGE_REQUEST_TURNS", "30")),
+        auth_session_ttl_seconds=int(os.getenv("AUTH_SESSION_TTL_SECONDS", "604800")),
+        auth_cookie_secure=os.getenv("AUTH_COOKIE_SECURE", "0") not in ("0", "false", "False"),
     )
