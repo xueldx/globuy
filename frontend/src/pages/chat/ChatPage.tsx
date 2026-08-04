@@ -1,13 +1,13 @@
-import { memo, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useState, type KeyboardEvent } from "react";
 import { useParams } from "react-router-dom";
-import { SafeStreamingMarkdown } from "@/components/chat/SafeStreamingMarkdown";
+import { VirtualMessageList } from "@/components/chat/VirtualMessageList";
 import { useChatStore } from "@/stores/chatStore";
 import type { ChatMessage } from "@/types";
 
 /** 空态共享引用：selector 在无分片时返回同一引用，避免每次 store 更新都重渲染 */
 const EMPTY_MESSAGES: ChatMessage[] = [];
 
-/** 聊天页：F2 SSE 流式 + F3 会话分片 + F4 安全流式 Markdown。 */
+/** 聊天页：F2 SSE + F3 会话分片 + F4 安全 Markdown + F5 虚拟滚动。 */
 export function Component() {
   const { sessionId } = useParams();
   const currentSessionId = useChatStore((s) => s.currentSessionId);
@@ -67,26 +67,16 @@ export function Component() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto p-4">
-        {loadingHistory && messages.length === 0 && (
-          <p className="mt-24 text-center text-sm text-muted">加载会话历史…</p>
-        )}
-        {!loadingHistory && messages.length === 0 && !isStreaming && (
-          <p className="mt-24 text-center text-sm text-muted">
-            {hasCurrentSession ? "还没有消息，说点什么开始吧" : "输入购物意图，开始一次跨境购物 Agent 对话"}
-          </p>
-        )}
-        {messages.map((msg) =>
-          // 激活消息用流式气泡（订阅 streamingBySession 叶子，逐 token 更新）；
-          // 其余用 memo 短路——后台会话在流时，本会话消息行零重渲染
-          msg.id === streamingMessageId ? (
-            <StreamingBubble key={msg.id} sessionId={viewSessionId ?? ""} />
-          ) : (
-            <MemoMessageRow key={msg.id} message={msg} />
-          ),
-        )}
-        {/* 滚动锚定叶子：页面不订阅流式文本，滚动跟随只让这个叶子重渲染 */}
-        <AutoScrollBottom messageCount={messages.length} sessionId={viewSessionId} />
+      <div className="min-h-0 flex-1">
+        <VirtualMessageList
+          key={viewSessionId ?? "new-session"}
+          messages={messages}
+          streamingMessageId={streamingMessageId}
+          sessionId={viewSessionId}
+          isStreaming={isStreaming}
+          loadingHistory={loadingHistory}
+          hasCurrentSession={hasCurrentSession}
+        />
       </div>
 
       <div className="shrink-0 border-t border-border bg-background/95 px-4 py-3">
@@ -133,78 +123,4 @@ export function Component() {
       </div>
     </div>
   );
-}
-
-function MessageRow({ message }: { message: ChatMessage }) {
-  const isUser = message.role === "user";
-  return (
-    <div className={`mb-3 flex ${isUser ? "justify-end" : "justify-start"}`}>
-      <div
-        className={`min-w-0 rounded-lg border bg-surface px-3 py-2 text-sm ${
-          isUser ? "max-w-[80%] border-primary/30" : "max-w-[88%]"
-        }`}
-      >
-        {!isUser && <p className="mb-1 text-xs text-muted">Agent</p>}
-        {isUser ? (
-          <p className="whitespace-pre-wrap break-words">{message.content}</p>
-        ) : (
-          <SafeStreamingMarkdown content={message.content} messageId={message.id} />
-        )}
-        {!isUser && (
-          <p className="mt-1 text-xs text-muted">
-          {message.status === "cancelled" && (
-              <span>（已停止）</span>
-          )}
-          {message.status === "error" && (
-              <span>（出错了）</span>
-          )}
-          </p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// 流式期间 messages 数组引用不变 → memo 短路，非激活消息零重渲染
-const MemoMessageRow = memo(MessageRow);
-
-function StreamingBubble({ sessionId }: { sessionId: string }) {
-  // 只订阅本会话的流式文本叶子：每来一个 token 仅此组件重渲染（增量渲染核心）
-  const streamingContent = useChatStore((s) =>
-    sessionId ? (s.streamingBySession[sessionId] ?? "") : "",
-  );
-  return (
-    <div className="mb-3 flex justify-start">
-      <div className="min-w-0 max-w-[88%] rounded-lg border bg-surface px-3 py-2 text-sm">
-        <p className="mb-1 text-xs text-muted">Agent</p>
-        <SafeStreamingMarkdown
-          content={streamingContent}
-          isStreaming
-          messageId={`streaming-${sessionId}`}
-        />
-      </div>
-    </div>
-  );
-}
-
-/**
- * 滚动锚定叶子（F6）：ChatPage 顶层不订阅 streamingBySession——每来一个 token 只有
- * 本叶子重渲染并滚底，消息行的 memo 与输入框都不动。滚动的代价与渲染的代价解耦。
- * 订阅的 key 是「展示会话」，谁在屏幕上滚谁的分片；切会话/新增消息/历史到齐都会触发一次。
- */
-function AutoScrollBottom({
-  messageCount,
-  sessionId,
-}: {
-  messageCount: number;
-  sessionId: string | null;
-}) {
-  const endRef = useRef<HTMLDivElement>(null);
-  const streamingContent = useChatStore((s) =>
-    sessionId ? (s.streamingBySession[sessionId] ?? "") : "",
-  );
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "auto" });
-  }, [messageCount, streamingContent, sessionId]);
-  return <div ref={endRef} />;
 }
