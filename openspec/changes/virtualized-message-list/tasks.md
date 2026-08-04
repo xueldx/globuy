@@ -11,8 +11,8 @@
 
 ## 3. Tests and integration
 
-- [ ] 3.1 Add component tests for virtual range props, stable identity, empty/loading states, and session isolation
-- [ ] 3.2 Add state tests for user reading protection, restore behavior, stream growth, and unmount cleanup
+- [x] 3.1 Add component tests for virtual range props, stable identity, empty/loading states, and session isolation
+- [x] 3.2 Add state tests for user reading protection, restore behavior, stream growth, and unmount cleanup
 - [x] 3.3 Replace the full message map and unconditional `AutoScrollBottom` in `ChatPage`
 
 ## 4. Verification and documentation
