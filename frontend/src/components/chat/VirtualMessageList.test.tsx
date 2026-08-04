@@ -273,7 +273,7 @@ describe("VirtualMessageList", () => {
     expect(screen.getByRole("button", { name: "↓ 回到最新" })).toBeInTheDocument();
   });
 
-  it("空白点击不算上滑，滚动条真实上移才进入阅读态", () => {
+  it("空白点击不算上滑，指针拖动造成真实上移才进入阅读态", () => {
     render(<VirtualMessageList {...baseProps} messages={[message(0), message(1)]} />);
     const scroller = screen.getByTestId("virtuoso-window");
     act(() => currentProps().atBottomStateChange?.(true));

@@ -17,6 +17,6 @@
 
 ## 4. Verification and documentation
 
-- [ ] 4.1 Run OpenSpec validation, frontend tests, typecheck, and production build
-- [ ] 4.2 Verify the rendered list at 1280 px and 375 px with long dynamic messages and user-scroll scenarios
-- [ ] 4.3 Run adversarial and quality reviews, resolve findings, and complete implementation, exception, and interview documents
+- [x] 4.1 Run OpenSpec validation, frontend tests, typecheck, and production build
+- [x] 4.2 Verify the rendered list at 1280 px and 375 px with long dynamic messages and user-scroll scenarios
+- [x] 4.3 Run adversarial and quality reviews, resolve findings, and complete implementation, exception, and interview documents

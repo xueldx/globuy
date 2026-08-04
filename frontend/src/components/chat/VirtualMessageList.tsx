@@ -149,10 +149,6 @@ export function VirtualMessageList({
     const scroller = scrollerRef.current;
     if (!scroller || event.target !== scroller) return;
 
-    const scrollbarWidth = scroller.offsetWidth - scroller.clientWidth;
-    const scrollbarLeft = scroller.getBoundingClientRect().right - scrollbarWidth;
-    if (scrollbarWidth <= 0 || event.clientX < scrollbarLeft) return;
-
     scrollbarPointerActiveRef.current = true;
     previousScrollTopRef.current = scroller.scrollTop;
   }, []);
