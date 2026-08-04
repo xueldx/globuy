@@ -69,4 +69,3 @@ The list SHALL render additional content above and below the viewport to reduce 
 #### Scenario: User scrolls quickly
 - **WHEN** the visible range changes faster than message components mount
 - **THEN** the configured top and bottom overscan provides already-mounted nearby content while keeping mounted message count bounded
-

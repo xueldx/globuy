@@ -15,6 +15,7 @@ import type { ChatMessage } from "@/types";
 
 export const BOTTOM_THRESHOLD_PX = 80;
 export const VIRTUAL_OVERSCAN = { top: 320, bottom: 640 } as const;
+const USER_SCROLL_INTENT_TTL_MS = 500;
 
 export type ScrollMode = "FOLLOWING" | "USER_READING" | "RESTORING";
 
@@ -52,8 +53,13 @@ export function VirtualMessageList({
   hasCurrentSession,
 }: VirtualMessageListProps) {
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  const scrollerRef = useRef<HTMLElement | null>(null);
   const heightFrameRef = useRef<number | null>(null);
-  const hasReachedBottomRef = useRef(false);
+  const userScrollIntentAtRef = useRef<number | null>(null);
+  const userScrollIntentExpiryRef = useRef<number | null>(null);
+  const touchYRef = useRef<number | null>(null);
+  const scrollbarPointerActiveRef = useRef(false);
+  const previousScrollTopRef = useRef(0);
   const [scrollMode, setScrollModeState] = useState<ScrollMode>("RESTORING");
   const scrollModeRef = useRef<ScrollMode>("RESTORING");
 
@@ -72,20 +78,143 @@ export function VirtualMessageList({
 
   const scrollToLatest = useCallback(() => {
     virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+    // 索引定位依赖尺寸缓存；Markdown 刚完成布局时再用真实 scrollHeight 消除最后的误差。
+    const scroller = scrollerRef.current;
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
   }, []);
 
   const scheduleLatestAlignment = useCallback(() => {
     if (heightFrameRef.current !== null) return;
     heightFrameRef.current = window.requestAnimationFrame(() => {
       heightFrameRef.current = null;
-      scrollToLatest();
+      const intentAt = userScrollIntentAtRef.current;
+      const hasFreshUserIntent =
+        intentAt !== null && Date.now() - intentAt <= USER_SCROLL_INTENT_TTL_MS;
+      if (scrollModeRef.current !== "USER_READING" && !hasFreshUserIntent) scrollToLatest();
     });
   }, [scrollToLatest]);
 
+  const cancelLatestAlignment = useCallback(() => {
+    if (heightFrameRef.current === null) return;
+    window.cancelAnimationFrame(heightFrameRef.current);
+    heightFrameRef.current = null;
+  }, []);
+
   const restoreLatest = useCallback(() => {
+    userScrollIntentAtRef.current = null;
+    if (userScrollIntentExpiryRef.current !== null) {
+      window.clearTimeout(userScrollIntentExpiryRef.current);
+      userScrollIntentExpiryRef.current = null;
+    }
     setScrollMode("RESTORING");
     scheduleLatestAlignment();
   }, [scheduleLatestAlignment, setScrollMode]);
+
+  const recordUserScrollIntent = useCallback(() => {
+    userScrollIntentAtRef.current = Date.now();
+    cancelLatestAlignment();
+    if (userScrollIntentExpiryRef.current !== null) {
+      window.clearTimeout(userScrollIntentExpiryRef.current);
+    }
+    userScrollIntentExpiryRef.current = window.setTimeout(() => {
+      userScrollIntentExpiryRef.current = null;
+      userScrollIntentAtRef.current = null;
+      if (scrollModeRef.current !== "USER_READING") scheduleLatestAlignment();
+    }, USER_SCROLL_INTENT_TTL_MS);
+  }, [cancelLatestAlignment, scheduleLatestAlignment]);
+
+  const handleWheel = useCallback(
+    (event: WheelEvent) => {
+      if (event.deltaY < 0) recordUserScrollIntent();
+    },
+    [recordUserScrollIntent],
+  );
+
+  const handleTouchStart = useCallback((event: TouchEvent) => {
+    touchYRef.current = event.touches[0]?.clientY ?? null;
+  }, []);
+
+  const handleTouchMove = useCallback(
+    (event: TouchEvent) => {
+      const nextY = event.touches[0]?.clientY ?? null;
+      if (nextY !== null && touchYRef.current !== null && nextY > touchYRef.current) {
+        recordUserScrollIntent();
+      }
+      touchYRef.current = nextY;
+    },
+    [recordUserScrollIntent],
+  );
+
+  const handlePointerDown = useCallback((event: PointerEvent) => {
+    const scroller = scrollerRef.current;
+    if (!scroller || event.target !== scroller) return;
+
+    const scrollbarWidth = scroller.offsetWidth - scroller.clientWidth;
+    const scrollbarLeft = scroller.getBoundingClientRect().right - scrollbarWidth;
+    if (scrollbarWidth <= 0 || event.clientX < scrollbarLeft) return;
+
+    scrollbarPointerActiveRef.current = true;
+    previousScrollTopRef.current = scroller.scrollTop;
+  }, []);
+
+  const handleScrollerScroll = useCallback(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const nextScrollTop = scroller.scrollTop;
+    if (scrollbarPointerActiveRef.current && nextScrollTop < previousScrollTopRef.current) {
+      recordUserScrollIntent();
+    }
+    previousScrollTopRef.current = nextScrollTop;
+  }, [recordUserScrollIntent]);
+
+  const handlePointerEnd = useCallback(() => {
+    scrollbarPointerActiveRef.current = false;
+  }, []);
+
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent) => {
+      if (["ArrowUp", "PageUp", "Home"].includes(event.key)) recordUserScrollIntent();
+    },
+    [recordUserScrollIntent],
+  );
+
+  const setScroller = useCallback(
+    (nextScroller: HTMLElement | Window | null) => {
+      const previousScroller = scrollerRef.current;
+      if (previousScroller) {
+        previousScroller.removeEventListener("wheel", handleWheel);
+        previousScroller.removeEventListener("touchstart", handleTouchStart);
+        previousScroller.removeEventListener("touchmove", handleTouchMove);
+        previousScroller.removeEventListener("pointerdown", handlePointerDown);
+        previousScroller.removeEventListener("scroll", handleScrollerScroll);
+        previousScroller.removeEventListener("keydown", handleKeyDown);
+        window.removeEventListener("pointerup", handlePointerEnd);
+        window.removeEventListener("pointercancel", handlePointerEnd);
+      }
+
+      scrollerRef.current = nextScroller instanceof HTMLElement ? nextScroller : null;
+      if (scrollerRef.current) {
+        previousScrollTopRef.current = scrollerRef.current.scrollTop;
+        scrollerRef.current.addEventListener("wheel", handleWheel, { passive: true });
+        scrollerRef.current.addEventListener("touchstart", handleTouchStart, { passive: true });
+        scrollerRef.current.addEventListener("touchmove", handleTouchMove, { passive: true });
+        scrollerRef.current.addEventListener("pointerdown", handlePointerDown, { passive: true });
+        scrollerRef.current.addEventListener("scroll", handleScrollerScroll, { passive: true });
+        scrollerRef.current.addEventListener("keydown", handleKeyDown);
+        window.addEventListener("pointerup", handlePointerEnd, { passive: true });
+        window.addEventListener("pointercancel", handlePointerEnd, { passive: true });
+      }
+    },
+    [
+      handleKeyDown,
+      handlePointerDown,
+      handlePointerEnd,
+      handleScrollerScroll,
+      handleTouchMove,
+      handleTouchStart,
+      handleWheel,
+    ],
+  );
 
   useEffect(() => {
     const previousId = previousLatestUserIdRef.current;
@@ -99,6 +228,10 @@ export function VirtualMessageList({
         window.cancelAnimationFrame(heightFrameRef.current);
         heightFrameRef.current = null;
       }
+      if (userScrollIntentExpiryRef.current !== null) {
+        window.clearTimeout(userScrollIntentExpiryRef.current);
+        userScrollIntentExpiryRef.current = null;
+      }
     },
     [],
   );
@@ -106,24 +239,52 @@ export function VirtualMessageList({
   const handleAtBottomChange = useCallback(
     (atBottom: boolean) => {
       if (atBottom) {
-        hasReachedBottomRef.current = true;
+        userScrollIntentAtRef.current = null;
+        if (userScrollIntentExpiryRef.current !== null) {
+          window.clearTimeout(userScrollIntentExpiryRef.current);
+          userScrollIntentExpiryRef.current = null;
+        }
         setScrollMode("FOLLOWING");
         return;
       }
 
-      // 首次定位到 LAST 前，Virtuoso 可能短暂报告 false。这不是用户滚动，不进入阅读态。
-      if (!hasReachedBottomRef.current || scrollModeRef.current === "RESTORING") return;
+      // 动态高度初次测量也会让“已到底”短暂变成 false。只有真实滚动输入才代表用户要读历史。
+      const intentAt = userScrollIntentAtRef.current;
+      const hasFreshUserIntent = intentAt !== null && Date.now() - intentAt <= USER_SCROLL_INTENT_TTL_MS;
+      if (!hasFreshUserIntent) {
+        userScrollIntentAtRef.current = null;
+        setScrollMode("RESTORING");
+        scheduleLatestAlignment();
+        return;
+      }
+
+      userScrollIntentAtRef.current = null;
+      if (userScrollIntentExpiryRef.current !== null) {
+        window.clearTimeout(userScrollIntentExpiryRef.current);
+        userScrollIntentExpiryRef.current = null;
+      }
+      cancelLatestAlignment();
       setScrollMode("USER_READING");
     },
-    [setScrollMode],
+    [cancelLatestAlignment, scheduleLatestAlignment, setScrollMode],
   );
 
   const handleTotalHeightChanged = useCallback(() => {
-    if (scrollModeRef.current !== "USER_READING") scheduleLatestAlignment();
+    const intentAt = userScrollIntentAtRef.current;
+    const hasFreshUserIntent =
+      intentAt !== null && Date.now() - intentAt <= USER_SCROLL_INTENT_TTL_MS;
+    if (scrollModeRef.current !== "USER_READING" && !hasFreshUserIntent) {
+      scheduleLatestAlignment();
+    }
   }, [scheduleLatestAlignment]);
 
   const followOutput = useCallback((isAtBottom: boolean): "auto" | false => {
-    if (scrollModeRef.current === "USER_READING" && !isAtBottom) return false;
+    const intentAt = userScrollIntentAtRef.current;
+    const hasFreshUserIntent =
+      intentAt !== null && Date.now() - intentAt <= USER_SCROLL_INTENT_TTL_MS;
+    if ((scrollModeRef.current === "USER_READING" || hasFreshUserIntent) && !isAtBottom) {
+      return false;
+    }
     return "auto";
   }, []);
 
@@ -144,6 +305,7 @@ export function VirtualMessageList({
     <div className="relative h-full min-h-0">
       <Virtuoso
         ref={virtuosoRef}
+        scrollerRef={setScroller}
         data={messages}
         className="h-full"
         components={listComponents}
@@ -181,7 +343,7 @@ export function VirtualMessageList({
 function MessageRow({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
   return (
-    <div data-message-id={message.id} className={`mb-3 flex ${isUser ? "justify-end" : "justify-start"}`}>
+    <div data-message-id={message.id} className={`flex pb-3 ${isUser ? "justify-end" : "justify-start"}`}>
       <div
         className={`min-w-0 rounded-lg border bg-surface px-3 py-2 text-sm ${
           isUser ? "max-w-[80%] border-primary/30" : "max-w-[88%]"
@@ -212,7 +374,7 @@ function StreamingBubble({ sessionId }: { sessionId: string }) {
   );
 
   return (
-    <div data-message-id={`streaming-${sessionId}`} className="mb-3 flex justify-start">
+    <div data-message-id={`streaming-${sessionId}`} className="flex justify-start pb-3">
       <div className="min-w-0 max-w-[88%] rounded-lg border bg-surface px-3 py-2 text-sm">
         <p className="mb-1 text-xs text-muted">Agent</p>
         <SafeStreamingMarkdown

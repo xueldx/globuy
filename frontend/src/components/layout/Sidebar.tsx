@@ -28,10 +28,10 @@ export default function Sidebar() {
   };
 
   return (
-    <aside className="flex w-60 shrink-0 flex-col gap-2 border-r bg-background p-3">
+    <aside className="flex w-full shrink-0 items-center gap-2 border-b bg-background p-2 md:w-60 md:flex-col md:items-stretch md:border-b-0 md:border-r md:p-3">
       <button
         onClick={handleNewChat}
-        className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+        className="min-h-10 shrink-0 rounded-md bg-primary px-3 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
       >
         + 新建会话
       </button>
@@ -49,7 +49,7 @@ export default function Sidebar() {
           </button>
         </div>
       ) : (
-        <nav className="flex flex-col gap-0.5 overflow-y-auto">
+        <nav className="flex min-w-0 flex-1 gap-0.5 overflow-x-auto md:flex-col md:overflow-y-auto">
           {sessions.length === 0 && (
             <p className="px-2 py-6 text-center text-xs text-muted">
               暂无会话，点「新建会话」开始

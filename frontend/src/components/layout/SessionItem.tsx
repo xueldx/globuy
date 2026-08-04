@@ -133,7 +133,7 @@ export default function SessionItem({ session, active, onSelect, onRename, onDel
   };
 
   return (
-    <div className="relative">
+    <div className="relative min-w-40 md:min-w-0">
       {mode === "rename" ? (
         <input
           ref={inputRef}
