@@ -5,6 +5,7 @@ import type {
   AgentProcessView,
   TradeEvent,
 } from "@/types";
+import { isTerminalGenerationEvent } from "@/lib/generationEvents";
 
 const TOOL_LABELS: Record<string, string> = {
   product_search_tool: "搜索商品",
@@ -50,7 +51,7 @@ export function processEventIdentity(event: TradeEvent): string | null {
 }
 
 export function isTerminalProcessError(event: TradeEvent): boolean {
-  return event.type === "error" && Boolean(text(event.payload?.error));
+  return event.type === "error" && isTerminalGenerationEvent(event.type, event.payload);
 }
 
 function toolLabel(tool: unknown): string {

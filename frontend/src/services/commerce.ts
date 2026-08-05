@@ -1,4 +1,5 @@
 import { API_BASE, ApiError, request } from "@/lib/api";
+import { isTerminalGenerationEvent } from "@/lib/generationEvents";
 import { SSEHttpError, SSEProtocolError, subscribeSSE, type SSEMessage } from "@/lib/stream";
 import type { GenerationSummary, SessionSummary, SessionTurn } from "@/types";
 
@@ -133,7 +134,7 @@ export async function subscribeGenerationWithResume(
         (event, envelope) => {
           cursor = Math.max(cursor, envelope.seq);
           attempt = 0;
-          if (["final.result", "cancelled", "error"].includes(event)) terminalEventSeen = true;
+          if (isTerminalGenerationEvent(event, envelope.payload)) terminalEventSeen = true;
           onEvent(event, envelope);
         },
         (retryMs) => {

@@ -84,7 +84,7 @@ function nowISO(): string {
 
 function recordProcessEvent(
   sessionId: string,
-  generationId: string,
+  generationId: string | undefined,
   event: string,
   seq: number | undefined,
   payload: unknown,
@@ -349,6 +349,13 @@ export const useChatStore = create<ChatState>((set, get) => {
             }
           }, controller.signal).catch((err) => {
             if (!controller.signal.aborted && get().streamingMsgIdBySession[sessionId] === assistantMsg.id) {
+              recordProcessEvent(
+                sessionId,
+                generation.generation_id,
+                "error",
+                undefined,
+                { error: (err as Error)?.message ?? "请求失败" },
+              );
               if (!renderer.hasContent()) {
                 renderer.replaceAndFlush(`[interrupted] ${(err as Error).message}`);
               } else {
@@ -556,11 +563,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           finalize("cancelled");
         }
         else {
-          useAgentProcessStore.getState().pushEvent(sid, {
-            type: "error",
-            payload: { error: (err as Error)?.message ?? "请求失败" },
-            occurred_at: nowISO(),
-            generation_id: ownedGenerationId,
+          recordProcessEvent(sid, ownedGenerationId, "error", undefined, {
+            error: (err as Error)?.message ?? "请求失败",
           });
           if (!renderer.hasContent()) {
             renderer.replaceAndFlush(`[error] ${(err as Error)?.message ?? "请求失败"}`);

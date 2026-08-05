@@ -26,16 +26,16 @@ describe("generation SSE service", () => {
     vi.restoreAllMocks();
   });
 
-  it("断流后从最后 seq 恢复，不会重新创建 generation", async () => {
+  it("诊断提醒后断流仍从最后 seq 恢复，不会误当终态", async () => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(sseResponse(
-        'id: 1\nevent: token.delta\ndata: {"generation_id":"gen-1","seq":1,"payload":{"token":"你"}}\n\n',
+        'id: 1\nevent: error\ndata: {"generation_id":"gen-1","seq":1,"payload":{"message":"正在重试","retrying":true}}\n\nid: 2\nevent: token.delta\ndata: {"generation_id":"gen-1","seq":2,"payload":{"token":"你"}}\n\n',
       ))
       .mockResolvedValueOnce(generationResponse("running"))
       .mockResolvedValueOnce(sseResponse(
-        'id: 2\nevent: final.result\ndata: {"generation_id":"gen-1","seq":2,"payload":{"text":"你好"}}\n\n',
+        'id: 3\nevent: final.result\ndata: {"generation_id":"gen-1","seq":3,"payload":{"text":"你好"}}\n\n',
       ));
     vi.stubGlobal("fetch", fetchMock);
     const events: string[] = [];
@@ -44,10 +44,10 @@ describe("generation SSE service", () => {
     await vi.advanceTimersByTimeAsync(400);
     await result;
 
-    expect(events).toEqual(["token.delta", "final.result"]);
+    expect(events).toEqual(["error", "token.delta", "final.result"]);
     expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(String(fetchMock.mock.calls[2][0])).toContain("after_seq=1");
-    expect(fetchMock.mock.calls[2][1]?.headers).toMatchObject({ "Last-Event-ID": "1" });
+    expect(String(fetchMock.mock.calls[2][0])).toContain("after_seq=2");
+    expect(fetchMock.mock.calls[2][1]?.headers).toMatchObject({ "Last-Event-ID": "2" });
     expect(fetchMock.mock.calls.every(([url]) => !String(url).includes("/generations") || !String(url).includes("/sessions/"))).toBe(true);
   });
 
