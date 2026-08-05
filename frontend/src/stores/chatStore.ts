@@ -1,6 +1,7 @@
 import { create } from "zustand";
-import type { ChatMessage, ChatMessageStatus, SessionSummary, SessionTurn, TradeEventType } from "@/types";
+import type { ChatMessage, ChatMessageStatus, SessionSummary, SessionTurn, TradeEvent, TradeEventType } from "@/types";
 import { ApiError } from "@/lib/api";
+import { isTerminalProcessError, projectAgentProcess } from "@/lib/agentProcess";
 import { createRafTextBuffer } from "@/lib/rafTextBuffer";
 import {
   deleteSession as apiDeleteSession,
@@ -81,6 +82,25 @@ function nowISO(): string {
   return new Date().toISOString();
 }
 
+function recordProcessEvent(
+  sessionId: string,
+  generationId: string,
+  event: string,
+  seq: number | undefined,
+  payload: unknown,
+): TradeEvent | null {
+  if (event === "user.message" || typeof payload !== "object" || payload === null) return null;
+  const processEvent: TradeEvent = {
+    type: event as TradeEventType,
+    payload: payload as Record<string, unknown>,
+    occurred_at: nowISO(),
+    generation_id: generationId,
+    seq,
+  };
+  useAgentProcessStore.getState().pushEvent(sessionId, processEvent);
+  return processEvent;
+}
+
 function fallbackTitle(query: string): string {
   const collapsed = query.replace(/\s+/g, " ").trim();
   return collapsed.length > 30 ? `${collapsed.slice(0, 30)}…` : collapsed;
@@ -143,11 +163,16 @@ export const useChatStore = create<ChatState>((set, get) => {
     // 竞态守卫：该消息已经不是这条会话的激活流（被新消息顶替 / 会话已删除）→ 丢弃
     if (get().streamingMsgIdBySession[sessionId] !== messageId) return;
     const content = get().streamingBySession[sessionId] ?? "";
+    const process = projectAgentProcess(
+      useAgentProcessStore.getState().eventsBySession[sessionId] ?? [],
+    ).steps;
     set((s) => ({
       messagesBySession: {
         ...s.messagesBySession,
         [sessionId]: (s.messagesBySession[sessionId] ?? []).map((m) =>
-          m.id === messageId ? { ...m, content, status } : m,
+          m.id === messageId
+            ? { ...m, content, status, process: process.length > 0 ? process : undefined }
+            : m,
         ),
       },
       streamingBySession: delKey(s.streamingBySession, sessionId),
@@ -283,6 +308,13 @@ export const useChatStore = create<ChatState>((set, get) => {
             active.lastSeq = envelope.seq ?? active.lastSeq;
             if (get().streamingMsgIdBySession[sessionId] !== assistantMsg.id) return;
             const payload = envelope.payload as { token?: string; text?: string; error?: string; message?: string };
+            const processEvent = recordProcessEvent(
+              sessionId,
+              generation.generation_id,
+              event,
+              envelope.seq,
+              envelope.payload,
+            );
             if (event === "user.message") {
               const text = payload.text?.trim();
               if (text) {
@@ -309,6 +341,7 @@ export const useChatStore = create<ChatState>((set, get) => {
               renderer.flush();
               finalizeStream(sessionId, assistantMsg.id, "cancelled");
             } else if (event === "error") {
+              if (processEvent && !isTerminalProcessError(processEvent)) return;
               const text = payload.error ?? payload.message;
               if (!renderer.hasContent() && text) renderer.replaceAndFlush(text);
               else renderer.flush();
@@ -469,6 +502,13 @@ export const useChatStore = create<ChatState>((set, get) => {
               active.lastSeq = envelope.seq ?? active.lastSeq;
               const payload = envelope.payload;
               if (!isActive()) return;
+              const processEvent = recordProcessEvent(
+                sid,
+                generation.generation_id,
+                event,
+                envelope.seq,
+                payload,
+              );
               switch (event) {
                 case "user.message":
                   // 当前发送链路已经乐观写入 user 消息；该事件只供刷新恢复使用。
@@ -492,6 +532,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                   break;
                 }
                 case "error": {
+                  if (processEvent && !isTerminalProcessError(processEvent)) break;
                   // 服务端真实错误帧用 {message}（orchestrator 校验拦截 / 异常回退）；
                   // 只有 SSE 超时的合成帧用 {error}。两个 key 都读，别让真实错误只剩空气泡。
                   const data = payload as { error?: string; message?: string };
@@ -502,16 +543,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                   break;
                 }
                 default:
-                  // 事件直接写入 generation 所属会话，后台流不能依赖当前视图决定是否入账。
-                  if (typeof payload === "object" && payload !== null) {
-                    useAgentProcessStore.getState().pushEvent(sid, {
-                      type: event as TradeEventType,
-                      payload: payload as Record<string, unknown>,
-                      occurred_at: nowISO(),
-                      generation_id: generation.generation_id,
-                      seq: envelope.seq,
-                    });
-                  }
+                  // 过程事件已在 switch 前按会话入账，这里不再处理正文。
               }
           },
           controller.signal,
@@ -524,6 +556,12 @@ export const useChatStore = create<ChatState>((set, get) => {
           finalize("cancelled");
         }
         else {
+          useAgentProcessStore.getState().pushEvent(sid, {
+            type: "error",
+            payload: { error: (err as Error)?.message ?? "请求失败" },
+            occurred_at: nowISO(),
+            generation_id: ownedGenerationId,
+          });
           if (!renderer.hasContent()) {
             renderer.replaceAndFlush(`[error] ${(err as Error)?.message ?? "请求失败"}`);
           } else {

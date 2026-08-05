@@ -11,10 +11,10 @@
 
 ## 3. UI and chat integration
 
-- [ ] 3.1 Rebuild `EventTimeline` as an accessible live/collapsed process panel
-- [ ] 3.2 Feed process events from both generation subscription paths and freeze terminal snapshots into assistant messages
-- [ ] 3.3 Render live and frozen process panels inside virtualized assistant rows
-- [ ] 3.4 Add component and integration tests for live updates, retained snapshots, and safe copy
+- [x] 3.1 Rebuild `EventTimeline` as an accessible live/collapsed process panel
+- [x] 3.2 Feed process events from both generation subscription paths and freeze terminal snapshots into assistant messages
+- [x] 3.3 Render live and frozen process panels inside virtualized assistant rows
+- [x] 3.4 Add component and integration tests for live updates, retained snapshots, and safe copy
 
 ## 4. Verification and documentation
 

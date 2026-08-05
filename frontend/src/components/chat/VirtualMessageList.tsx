@@ -9,6 +9,7 @@ import {
   type HTMLAttributes,
 } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import EventTimeline, { LiveEventTimeline } from "@/components/agent/EventTimeline";
 import { SafeStreamingMarkdown } from "@/components/chat/SafeStreamingMarkdown";
 import { useChatStore } from "@/stores/chatStore";
 import type { ChatMessage } from "@/types";
@@ -346,6 +347,12 @@ function MessageRow({ message }: { message: ChatMessage }) {
         }`}
       >
         {!isUser && <p className="mb-1 text-xs text-muted">Agent</p>}
+        {!isUser && message.process && message.process.length > 0 && (
+          <EventTimeline
+            steps={message.process}
+            status={message.status === "done" ? "completed" : message.status === "cancelled" ? "cancelled" : "failed"}
+          />
+        )}
         {isUser ? (
           <p className="whitespace-pre-wrap break-words">{message.content}</p>
         ) : (
@@ -373,6 +380,7 @@ function StreamingBubble({ sessionId }: { sessionId: string }) {
     <div data-message-id={`streaming-${sessionId}`} className="flex justify-start pb-3">
       <div className="min-w-0 max-w-[88%] rounded-lg border bg-surface px-3 py-2 text-sm">
         <p className="mb-1 text-xs text-muted">Agent</p>
+        <LiveEventTimeline sessionId={sessionId} />
         <SafeStreamingMarkdown
           content={streamingContent}
           isStreaming

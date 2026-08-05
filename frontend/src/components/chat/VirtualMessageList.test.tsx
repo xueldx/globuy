@@ -2,6 +2,7 @@ import { forwardRef, useImperativeHandle, type Ref } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage } from "@/types";
+import { useAgentProcessStore } from "@/stores/agentProcessStore";
 
 interface MockVirtuosoProps {
   data: ChatMessage[];
@@ -89,6 +90,7 @@ describe("VirtualMessageList", () => {
     vi.useFakeTimers();
     virtuosoHarness.props = null;
     virtuosoHarness.scrollToIndex.mockReset();
+    useAgentProcessStore.getState().reset();
   });
 
   afterEach(() => {
@@ -320,5 +322,53 @@ describe("VirtualMessageList", () => {
       />,
     );
     expect(screen.getByText("输入购物意图，开始一次跨境购物 Agent 对话")).toBeInTheDocument();
+  });
+
+  it("流式消息显示实时过程，定型消息保留可回看的步骤快照", () => {
+    useAgentProcessStore.getState().pushEvent("session-a", {
+      type: "tool.invoke",
+      payload: { tool: "web_search_tool", args: { query: "关税政策" } },
+      occurred_at: "2026-08-05T18:00:01+08:00",
+      generation_id: "gen-a",
+      seq: 1,
+    });
+    const streaming = { ...message(1, "assistant"), status: "streaming" as const };
+    const { rerender } = render(
+      <VirtualMessageList
+        {...baseProps}
+        messages={[streaming]}
+        streamingMessageId={streaming.id}
+        isStreaming
+      />,
+    );
+    expect(screen.getAllByText("查询跨境信息")).toHaveLength(2);
+
+    rerender(
+      <VirtualMessageList
+        {...baseProps}
+        messages={[{
+          ...streaming,
+          status: "done",
+          process: [{
+            id: "frozen-1",
+            kind: "tool",
+            title: "查询跨境信息",
+            detail: "找到 4 个候选结果",
+            status: "completed",
+            startedAt: "2026-08-05T18:00:01+08:00",
+            completedAt: "2026-08-05T18:00:02+08:00",
+            durationMs: 1000,
+          }],
+        }]}
+        streamingMessageId={null}
+        isStreaming={false}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: /处理完成.*1\/1/s });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("查询跨境信息")).toBeInTheDocument();
   });
 });
