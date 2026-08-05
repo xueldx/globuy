@@ -19,6 +19,43 @@ export interface TradeEvent {
   type: TradeEventType;
   payload: Record<string, any>;
   occurred_at: string;
+  /** generation SSE 身份，用于断线回放去重。旧 WS 事件可能没有。 */
+  generation_id?: string;
+  seq?: number;
+}
+
+export type AgentProcessStepStatus = "running" | "completed" | "warning" | "failed" | "cancelled";
+
+export type AgentProcessStepKind =
+  | "queue"
+  | "agent"
+  | "tool"
+  | "plan"
+  | "context"
+  | "fallback"
+  | "cache"
+  | "response"
+  | "notice";
+
+/** 供 UI 使用的安全步骤快照，不保留工具原始参数。 */
+export interface AgentProcessStep {
+  id: string;
+  kind: AgentProcessStepKind;
+  title: string;
+  detail: string;
+  status: AgentProcessStepStatus;
+  startedAt: string;
+  completedAt?: string;
+  durationMs?: number;
+}
+
+export type AgentProcessStatus = "idle" | "running" | "completed" | "cancelled" | "failed";
+
+export interface AgentProcessView {
+  steps: AgentProcessStep[];
+  status: AgentProcessStatus;
+  completedCount: number;
+  activeLabel: string;
 }
 
 export interface LandedPrice {
@@ -59,6 +96,8 @@ export interface ChatMessage {
   createdAt: string;
   /** Agent 思考过程（F6 渲染） */
   thinking?: string;
+  /** 本轮结束时冻结的过程步骤；不含原始工具参数。 */
+  process?: AgentProcessStep[];
 }
 
 /** 会话列表条目（服务端 GET /commerce/sessions 直出，服务端是真相源）。

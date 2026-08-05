@@ -246,10 +246,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       ) {
         return;
       }
-      // 切换查看的会话：清空上一会话的过程事件时间线（events 无界累积防护；F6 落地时按 sessionId 归位）
-      if (state.currentSessionId && state.currentSessionId !== sessionId) {
-        useAgentProcessStore.getState().reset();
-      }
       // ② 已有活跃流 → 本地分片就是真相（当轮还没落库，拉历史会抹掉增长中的文本）
       if (activeStreams.has(sessionId)) {
         set({ currentSessionId: sessionId });
@@ -278,6 +274,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           const controller = new AbortController();
           activeStreams.set(sessionId, controller);
           activeGenerations.set(sessionId, { generationId: generation.generation_id, lastSeq: 0 });
+          useAgentProcessStore.getState().beginRun(sessionId);
           const renderer = createStreamRenderBuffer(sessionId, assistantMsg.id);
           void subscribeGenerationWithResume(generation.generation_id, 0, (event, raw) => {
             const envelope = raw as { generation_id?: string; seq?: number; payload?: unknown };
@@ -412,6 +409,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
 
       const sid = sessionId;
+      useAgentProcessStore.getState().beginRun(sid);
       const userMsg: ChatMessage = {
         id: makeId("u"),
         role: "user",
@@ -504,17 +502,14 @@ export const useChatStore = create<ChatState>((set, get) => {
                   break;
                 }
                 default:
-                  // 过程事件：只喂给「当前在看的会话」的时间线（agentProcessStore 未分片，
-                  // 后台流的入账是 F6 的活；这里不喂就不会串到别的会话视图）
-                  if (
-                    get().currentSessionId === sid &&
-                    typeof payload === "object" &&
-                    payload !== null
-                  ) {
-                    useAgentProcessStore.getState().pushEvent({
+                  // 事件直接写入 generation 所属会话，后台流不能依赖当前视图决定是否入账。
+                  if (typeof payload === "object" && payload !== null) {
+                    useAgentProcessStore.getState().pushEvent(sid, {
                       type: event as TradeEventType,
                       payload: payload as Record<string, unknown>,
                       occurred_at: nowISO(),
+                      generation_id: generation.generation_id,
+                      seq: envelope.seq,
                     });
                   }
               }
@@ -619,7 +614,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
       // ④ 服务端确认（含 404 幂等）后才清分片；删的是当前会话则顺带清掉它的过程时间线
       const commitRemoval = () => {
-        if (wasCurrent) useAgentProcessStore.getState().reset();
+        useAgentProcessStore.getState().clearSession(sessionId);
         set((s) => ({
           messagesBySession: delKey(s.messagesBySession, sessionId),
           streamingMsgIdBySession: delKey(s.streamingMsgIdBySession, sessionId),

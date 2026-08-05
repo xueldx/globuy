@@ -5,9 +5,9 @@
 
 ## 2. Event model and store
 
-- [ ] 2.1 Add process step types and a pure event-to-step projector with safe summaries
-- [ ] 2.2 Replace the global process array with session-scoped, deduplicated, bounded event storage
-- [ ] 2.3 Add projector and store tests for pairing, terminal states, diagnostics, privacy, and limits
+- [x] 2.1 Add process step types and a pure event-to-step projector with safe summaries
+- [x] 2.2 Replace the global process array with session-scoped, deduplicated, bounded event storage
+- [x] 2.3 Add projector and store tests for pairing, terminal states, diagnostics, privacy, and limits
 
 ## 3. UI and chat integration
 
