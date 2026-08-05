@@ -21,7 +21,7 @@ describe("EventTimeline", () => {
 
   it("运行中默认展开并展示当前步骤、进度和状态文字", () => {
     const view = projectAgentProcess([
-      event("tool.invoke", 1, { tool: "product_search_tool", args: { query: "降噪耳机" } }),
+      event("tool.invoke", 1, { tool: "product_search_tool", args: { normalized_query: "降噪耳机" } }),
     ]);
     render(<EventTimeline steps={view.steps} status={view.status} live />);
 

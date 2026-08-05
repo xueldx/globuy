@@ -62,7 +62,7 @@ export default function EventTimeline({ steps, status, live = false }: EventTime
   const shownSteps = steps.length > 0 ? steps : live ? [preparingStep()] : [];
   if (shownSteps.length === 0) return null;
 
-  const completedCount = shownSteps.filter((step) => step.status === "completed").length;
+  const completedCount = shownSteps.filter((step) => ["completed", "warning"].includes(step.status)).length;
   const activeStep = [...shownSteps].reverse().find((step) => step.status === "running");
   const headline = activeStep?.title ?? PANEL_COPY[status].label;
 

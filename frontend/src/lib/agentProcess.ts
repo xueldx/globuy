@@ -78,7 +78,7 @@ function toolDetail(tool: string, payload: Record<string, any>, result: boolean)
     return query ? `搜索：${query}` : "查询公开跨境信息";
   }
   if (tool === "product_search_tool") {
-    const query = text(args.query ?? args.raw_query ?? args.keyword);
+    const query = text(args.normalized_query);
     return query ? `检索：${query}` : "按预算与偏好筛选商品";
   }
   if (tool === "category_insight_tool") {
@@ -335,7 +335,7 @@ export function projectAgentProcess(events: TradeEvent[]): AgentProcessView {
   return {
     steps: safeSteps,
     status,
-    completedCount: safeSteps.filter((step) => step.status === "completed").length,
+    completedCount: safeSteps.filter((step) => ["completed", "warning"].includes(step.status)).length,
     activeLabel,
   };
 }

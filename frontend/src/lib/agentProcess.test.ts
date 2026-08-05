@@ -15,7 +15,7 @@ function event(type: TradeEvent["type"], seq: number, payload: Record<string, an
 describe("projectAgentProcess", () => {
   it("把工具开始、业务结果和耗时结果归并成一个步骤", () => {
     const view = projectAgentProcess([
-      event("tool.invoke", 1, { tool: "product_search_tool", args: { query: "通勤降噪耳机" } }),
+      event("tool.invoke", 1, { tool: "product_search_tool", args: { normalized_query: "通勤降噪耳机" } }),
       event("tool.result", 2, { tool: "product_search_tool", hit_count: 7 }),
       event("tool.result", 3, { tool: "product_search_tool", elapsed_ms: 1260 }),
       event("final.result", 4, { text: "结果" }),
@@ -79,6 +79,7 @@ describe("projectAgentProcess", () => {
       "已改用 backup",
     ]);
     expect(view.steps.at(-1)?.status).toBe("warning");
+    expect(view.completedCount).toBe(4);
   });
 
   it("订单参数、电话、完整地址与内部错误不会进入步骤快照", () => {
