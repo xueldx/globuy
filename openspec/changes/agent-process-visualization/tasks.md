@@ -18,7 +18,7 @@
 
 ## 4. Verification and documentation
 
-- [ ] 4.1 Run OpenSpec validation, frontend tests, typecheck, and production build
-- [ ] 4.2 Verify the rendered panel at 1280 px and 375 px, in light/dark mode and reduced motion
-- [ ] 4.3 Run adversarial race/privacy review and code-quality review, then resolve findings
-- [ ] 4.4 Complete implementation, exception, and interview documents and update F6 status
+- [x] 4.1 Run OpenSpec validation, frontend tests, typecheck, and production build
+- [x] 4.2 Verify the rendered panel at 1280 px and 375 px, in light/dark mode and reduced motion
+- [x] 4.3 Run adversarial race/privacy review and code-quality review, then resolve findings
+- [x] 4.4 Complete implementation, exception, and interview documents and update F6 status
