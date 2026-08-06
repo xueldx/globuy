@@ -106,7 +106,8 @@ def load_settings() -> Settings:
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
         llm_model=os.getenv("LLM_MODEL", "qwen3-max"),
-        port=int(os.getenv("PORT", "8000")),
+        # 与同工作区的 Globex 默认 8000 隔离，避免开发时 API 被错误服务接管。
+        port=int(os.getenv("PORT", "8010")),
         log_level=os.getenv("LOG_LEVEL", "info"),
         # embedding 默认复用 LLM 网关（OpenAI 兼容 /v1/embeddings）
         embedding_base_url=os.getenv("EMBEDDING_BASE_URL", llm_base_url),
@@ -128,7 +129,7 @@ def load_settings() -> Settings:
         tool_circuit_reset_seconds=float(os.getenv("TOOL_CIRCUIT_RESET_SECONDS", "60")),
         cors_origins=[
             origin.strip()
-            for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+            for origin in os.getenv("CORS_ORIGINS", "http://localhost:5180").split(",")
             if origin.strip()
         ],
         # 实测 qwen3.7-plus 配额池极紧（单发一条也可能 429），默认配上备用模型保底，

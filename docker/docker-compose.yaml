@@ -4,7 +4,7 @@
 #   cd globuy-agent
 #   export LLM_BASE_URL=<网关地址> LLM_API_KEY=<密钥>   # 敏感配置走环境变量，不落盘
 #   docker compose -f docker/docker-compose.yaml up -d --build
-#   前端 http://localhost:5173，后端 http://localhost:8000
+#   前端 http://localhost:5180，后端 http://localhost:8010
 #
 # 存储用 SQLite，落在 app-data 卷（零外部依赖，无需额外容器）。
 # 注意：compose 形态下 QDRANT_URL 指向 qdrant 服务（覆盖本地嵌入模式）。
@@ -14,7 +14,7 @@ services:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8010:8000"
     environment:
       # 敏感配置透传宿主机环境变量，缺失时直接报错，避免明文落盘
       LLM_BASE_URL: ${LLM_BASE_URL:?需设置 LLM_BASE_URL}
@@ -39,7 +39,7 @@ services:
       QUEUE_ENABLED: ${QUEUE_ENABLED:-1}
       QUEUE_WAIT_SECONDS: ${QUEUE_WAIT_SECONDS:-300}
       DATA_DIR: /app/data
-      CORS_ORIGINS: http://localhost:5173
+      CORS_ORIGINS: http://localhost:5180
     volumes:
       - app-data:/app/data
     depends_on:
@@ -107,9 +107,9 @@ services:
     working_dir: /app
     command: sh -c "npm install && npm run dev"
     ports:
-      - "5173:5173"
+      - "5180:5180"
     environment:
-      VITE_API_BASE: http://localhost:8000
+      VITE_API_BASE: http://localhost:8010
     volumes:
       - ../frontend:/app
       - frontend-modules:/app/node_modules

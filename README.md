@@ -77,7 +77,7 @@ LLM_API_KEY=your-api-key
 启动 API：
 
 ```bash
-uv run uvicorn app.presentation.server:app --host 0.0.0.0 --port 8000
+uv run uvicorn app.presentation.server:app --host 0.0.0.0 --port 8010
 ```
 
 未配置 `REDIS_URL` 时，缓存和队列自动关闭；未配置 `QDRANT_URL` 时，Qdrant 使用本地嵌入模式。
@@ -90,7 +90,7 @@ npm ci
 npm run dev
 ```
 
-浏览器访问 `http://localhost:5173`。后端默认地址为 `http://localhost:8000`，需要覆盖时设置 `VITE_API_BASE`。
+浏览器访问 `http://localhost:5180`。后端默认地址为 `http://localhost:8010`，需要覆盖时设置 `VITE_API_BASE`。
 
 ### 启动 worker
 
@@ -145,7 +145,7 @@ npm run build
 uv run python scripts/smoke_e2e.py
 uv run python scripts/verify_parallel.py
 uv run python scripts/eval_regression.py
-uv run python scripts/loadtest.py --base-url http://localhost:8000 --stages 5,10,20
+uv run python scripts/loadtest.py --base-url http://localhost:8010 --stages 5,10,20
 ```
 
 ## Docker

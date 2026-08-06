@@ -11,10 +11,13 @@ export default defineConfig({
   },
   server: {
     host: "0.0.0.0",
-    port: 5173,
+    // Globuy 与同工作区的 Globex 共存时不能共用开发端口，
+    // 否则浏览器会显示另一个项目的页面，/api 也会被代理到错误后端。
+    port: 5180,
+    strictPort: true,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8000",
+        target: "http://127.0.0.1:8010",
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ""),
       },
