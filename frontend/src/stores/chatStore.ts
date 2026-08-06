@@ -41,7 +41,7 @@ export interface ChatState {
   streamingMsgIdBySession: Record<string, string>;
   streamingBySession: Record<string, string>;
   statusBySession: Record<string, ChatMessageStatus | null>;
-  /** 历史拉取进行中（幂等守卫的开关） */
+  /** 会话初始化/历史拉取进行中（幂等守卫的开关） */
   loadingBySession: Record<string, boolean>;
   /** 全局一次性提示（并发超限 / 删除失败等） */
   notice: string | null;
@@ -276,7 +276,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         set({ currentSessionId: sessionId });
         return;
       }
+      // 必须在任何 await 之前认领加载权。React StrictMode 会在新浏览器的首次挂载时
+      // 重放 effect；若等查完 generation 才置位，两次调用都会拉同一份 turns，
+      // 第二次再把它和第一次已写入的本地历史拼接，导致消息成倍显示。
+      if (get().loadingBySession[sessionId]) {
+        set({ currentSessionId: sessionId });
+        return;
+      }
       set({ currentSessionId: sessionId });
+      set((s) => ({ loadingBySession: setKey(s.loadingBySession, sessionId, true) }));
       // 刷新/断网恢复：运行状态在服务端，不从已消失的内存 boolean 猜。
       // 从 seq=0 回放是安全的，当前页还没有消费记录；generationId+seq 双守卫会去重。
       try {
@@ -370,17 +378,18 @@ export const useChatStore = create<ChatState>((set, get) => {
               activeGenerations.delete(sessionId);
             }
           });
+          // 运行中的 generation 已交给 SSE 链路；释放首次加载锁，后续路由切换可直接命中本地分片。
+          set((s) => ({ loadingBySession: delKey(s.loadingBySession, sessionId) }));
           return;
         }
       } catch {
         // 404 表示没有活跃 generation，继续走已定型历史加载。
       }
       // ③ 历史已缓存 → 直接渲染本地
-      if ((state.messagesBySession[sessionId]?.length ?? 0) > 0) return;
-      // 拉取中 → 不重复发请求
-      if (state.loadingBySession[sessionId]) return;
-
-      set((s) => ({ loadingBySession: setKey(s.loadingBySession, sessionId, true) }));
+      if ((get().messagesBySession[sessionId]?.length ?? 0) > 0) {
+        set((s) => ({ loadingBySession: delKey(s.loadingBySession, sessionId) }));
+        return;
+      }
       try {
         const turns = await fetchTurns(sessionId);
         // await 之后回查：期间用户又切走了 → 丢弃这份结果，不许污染别人的视图
