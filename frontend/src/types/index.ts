@@ -70,6 +70,18 @@ export interface LandedPrice {
   unavailable_reason?: string;
 }
 
+export type CitationSourceType = "catalog" | "calculation" | "knowledge" | "web";
+
+/** 进入 UI 前已经过运行时校验的来源。 */
+export interface CitationSource {
+  source_id: string;
+  source_type: CitationSourceType;
+  label: string;
+  summary: string;
+  fields?: string[];
+  url?: string;
+}
+
 export interface ProductCard {
   product_id: string;
   title: string;
@@ -82,6 +94,13 @@ export interface ProductCard {
   skus: { sku_id: string; spec: string; price_major: number; currency: string; stock: number }[];
   score: number;
   landed_price?: LandedPrice;
+  citations: CitationSource[];
+}
+
+export interface CommerceArtifacts {
+  products: ProductCard[];
+  /** 回答级来源；商品自己的目录和计价依据保留在 ProductCard.citations。 */
+  sources: CitationSource[];
 }
 
 // ===== 会话与消息（F1 引入，F3 填充完整状态机）=====
@@ -98,6 +117,10 @@ export interface ChatMessage {
   thinking?: string;
   /** 本轮结束时冻结的过程步骤；不含原始工具参数。 */
   process?: AgentProcessStep[];
+  /** 本轮结束时冻结的结构化商品结果。 */
+  products?: ProductCard[];
+  /** 本轮结束时冻结的知识库与网页来源。 */
+  sources?: CitationSource[];
 }
 
 /** 会话列表条目（服务端 GET /commerce/sessions 直出，服务端是真相源）。

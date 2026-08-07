@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { ChatMessage, ChatMessageStatus, SessionSummary, SessionTurn, TradeEvent, TradeEventType } from "@/types";
 import { ApiError } from "@/lib/api";
 import { isTerminalProcessError, projectAgentProcess } from "@/lib/agentProcess";
+import { projectCommerceArtifacts } from "@/lib/commerceArtifacts";
 import { createRafTextBuffer } from "@/lib/rafTextBuffer";
 import {
   deleteSession as apiDeleteSession,
@@ -163,15 +164,22 @@ export const useChatStore = create<ChatState>((set, get) => {
     // 竞态守卫：该消息已经不是这条会话的激活流（被新消息顶替 / 会话已删除）→ 丢弃
     if (get().streamingMsgIdBySession[sessionId] !== messageId) return;
     const content = get().streamingBySession[sessionId] ?? "";
-    const process = projectAgentProcess(
-      useAgentProcessStore.getState().eventsBySession[sessionId] ?? [],
-    ).steps;
+    const events = useAgentProcessStore.getState().eventsBySession[sessionId] ?? [];
+    const process = projectAgentProcess(events).steps;
+    const commerce = projectCommerceArtifacts(events);
     set((s) => ({
       messagesBySession: {
         ...s.messagesBySession,
         [sessionId]: (s.messagesBySession[sessionId] ?? []).map((m) =>
           m.id === messageId
-            ? { ...m, content, status, process: process.length > 0 ? process : undefined }
+            ? {
+                ...m,
+                content,
+                status,
+                process: process.length > 0 ? process : undefined,
+                products: commerce.products.length > 0 ? commerce.products : undefined,
+                sources: commerce.sources.length > 0 ? commerce.sources : undefined,
+              }
             : m,
         ),
       },

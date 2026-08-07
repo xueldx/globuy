@@ -11,9 +11,9 @@
 
 ## 3. Frontend projection and state
 
-- [ ] 3.1 Add commerce artifact types and a runtime-safe event projector
-- [ ] 3.2 Freeze projected products and sources into the matching assistant message on terminal events
-- [ ] 3.3 Add projector and chat-store tests for bad entries, URLs, deduplication, grouping, and snapshots
+- [x] 3.1 Add commerce artifact types and a runtime-safe event projector
+- [x] 3.2 Freeze projected products and sources into the matching assistant message on terminal events
+- [x] 3.3 Add projector and chat-store tests for bad entries, URLs, deduplication, grouping, and snapshots
 
 ## 4. UI integration
 
