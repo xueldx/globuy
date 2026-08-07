@@ -30,6 +30,10 @@ function finiteNumber(value: unknown, minimum = 0): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= minimum ? value : null;
 }
 
+function nonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 function safeHttpUrl(value: unknown): string | undefined {
   if (typeof value !== "string" || !value.trim()) return undefined;
   try {
@@ -101,7 +105,7 @@ function parseSku(value: unknown): ProductCard["skus"][number] | null {
   const spec = nonEmptyString(raw.spec);
   const currency = nonEmptyString(raw.currency);
   const price = finiteNumber(raw.price_major);
-  const stock = finiteNumber(raw.stock);
+  const stock = nonNegativeInteger(raw.stock);
   if (!skuId || !spec || !currency || price === null || stock === null) return null;
   return { sku_id: skuId, spec, currency, price_major: price, stock };
 }
@@ -116,7 +120,7 @@ export function parseProductCard(value: unknown): ProductCard | null {
   const originCountry = nonEmptyString(raw.origin_country);
   const currency = nonEmptyString(raw.currency);
   const price = finiteNumber(raw.price_major);
-  const score = finiteNumber(raw.score);
+  const score = finiteNumber(raw.score, Number.NEGATIVE_INFINITY);
   if (
     !productId || !title || !brand || !category || !originCountry || !currency ||
     price === null || score === null
@@ -158,6 +162,14 @@ function dedupeSources(sources: CitationSource[]): CitationSource[] {
   return [...byId.values()];
 }
 
+function dedupeProducts(products: ProductCard[]): ProductCard[] {
+  const byId = new Map<string, ProductCard>();
+  for (const product of products) {
+    if (!byId.has(product.product_id)) byId.set(product.product_id, product);
+  }
+  return [...byId.values()];
+}
+
 /**
  * 把不可信的工具事件投影成组件可直接消费的数据。
  * 单条坏数据只会被跳过，不会拖垮整条助手消息。
@@ -184,9 +196,11 @@ export function projectCommerceArtifacts(events: TradeEvent[]): CommerceArtifact
   }
 
   return {
-    products: (latestProductHits ?? [])
-      .map(parseProductCard)
-      .filter((item): item is ProductCard => item !== null),
+    products: dedupeProducts(
+      (latestProductHits ?? [])
+        .map(parseProductCard)
+        .filter((item): item is ProductCard => item !== null),
+    ),
     sources: dedupeSources(answerSources),
   };
 }

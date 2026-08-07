@@ -9,6 +9,7 @@ import {
   type HTMLAttributes,
 } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import { CommerceArtifacts, LiveCommerceArtifacts } from "@/components/agent/CommerceArtifacts";
 import EventTimeline, { LiveEventTimeline } from "@/components/agent/EventTimeline";
 import { SafeStreamingMarkdown } from "@/components/chat/SafeStreamingMarkdown";
 import { useChatStore } from "@/stores/chatStore";
@@ -358,6 +359,7 @@ function MessageRow({ message }: { message: ChatMessage }) {
         ) : (
           <SafeStreamingMarkdown content={message.content} messageId={message.id} />
         )}
+        {!isUser && <CommerceArtifacts products={message.products} sources={message.sources} />}
         {!isUser && message.status === "cancelled" && (
           <p className="mt-1 text-xs text-muted">（已停止）</p>
         )}
@@ -386,6 +388,7 @@ function StreamingBubble({ sessionId }: { sessionId: string }) {
           isStreaming
           messageId={`streaming-${sessionId}`}
         />
+        <LiveCommerceArtifacts sessionId={sessionId} />
       </div>
     </div>
   );

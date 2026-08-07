@@ -17,14 +17,14 @@
 
 ## 4. UI integration
 
-- [ ] 4.1 Rebuild product cards with responsive comparison hierarchy and per-card evidence disclosure
-- [ ] 4.2 Add an accessible inline answer-source panel with safe external links
-- [ ] 4.3 Render live and frozen artifacts inside virtualized assistant rows
-- [ ] 4.4 Add component and integration tests for responsive states, disclosure controls, and missing landed price
+- [x] 4.1 Rebuild product cards with responsive comparison hierarchy and per-card evidence disclosure
+- [x] 4.2 Add an accessible inline answer-source panel with safe external links
+- [x] 4.3 Render live and frozen artifacts inside virtualized assistant rows
+- [x] 4.4 Add component and integration tests for responsive states, disclosure controls, and missing landed price
 
 ## 5. Verification and documentation
 
-- [ ] 5.1 Run OpenSpec validation, backend tests, frontend tests, typecheck, and production build
-- [ ] 5.2 Verify 1280 px and 375 px layouts in light/dark mode with long content and expanded sources
-- [ ] 5.3 Run adversarial resilience review and code-quality review, then resolve findings
-- [ ] 5.4 Complete implementation, exception, and interview documents and update F7 status
+- [x] 5.1 Run OpenSpec validation, backend tests, frontend tests, typecheck, and production build
+- [x] 5.2 Verify 1280 px and 375 px layouts in light/dark mode with long content and expanded sources
+- [x] 5.3 Run adversarial resilience review and code-quality review, then resolve findings
+- [x] 5.4 Complete implementation, exception, and interview documents and update F7 status

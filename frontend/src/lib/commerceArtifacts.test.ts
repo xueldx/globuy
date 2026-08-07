@@ -48,6 +48,17 @@ describe("projectCommerceArtifacts", () => {
     expect(view.products.map((item) => item.product_id)).toEqual(["NEW"]);
   });
 
+  it("允许负相关度分数，并按商品 id 去重", () => {
+    const view = projectCommerceArtifacts([
+      event(1, {
+        tool: "product_search_tool",
+        hits: [product({ score: -0.1 }), product({ score: 0.5 })],
+      }),
+    ]);
+    expect(view.products).toHaveLength(1);
+    expect(view.products[0].score).toBe(-0.1);
+  });
+
   it("过滤坏 SKU、无效到手价和危险链接，同时保留其余内容", () => {
     const view = projectCommerceArtifacts([
       event(1, {

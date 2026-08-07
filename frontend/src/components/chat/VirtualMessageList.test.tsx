@@ -371,4 +371,54 @@ describe("VirtualMessageList", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("查询跨境信息")).toBeInTheDocument();
   });
+
+  it("流式消息显示实时商品，定型消息改读冻结的商品与来源", () => {
+    const product = {
+      product_id: "P1001",
+      title: "实时旅行三件套",
+      brand: "GoLight",
+      category: "旅行装备",
+      origin_country: "CN",
+      price_major: 199,
+      currency: "CNY",
+      highlights: ["轻便"],
+      skus: [],
+      score: 0.91,
+      citations: [],
+    };
+    useAgentProcessStore.getState().pushEvent("session-a", {
+      type: "tool.result",
+      payload: { tool: "product_search_tool", hits: [product] },
+      occurred_at: "2026-08-07T18:00:01+08:00",
+      generation_id: "gen-f7",
+      seq: 1,
+    });
+    const streaming = { ...message(1, "assistant"), status: "streaming" as const };
+    const { rerender } = render(
+      <VirtualMessageList {...baseProps} messages={[streaming]} streamingMessageId={streaming.id} isStreaming />,
+    );
+    expect(screen.getByText("实时旅行三件套")).toBeInTheDocument();
+
+    rerender(
+      <VirtualMessageList
+        {...baseProps}
+        messages={[{
+          ...streaming,
+          status: "done",
+          products: [{ ...product, title: "冻结旅行三件套" }],
+          sources: [{
+            source_id: "knowledge:travel",
+            source_type: "knowledge",
+            label: "旅行装备指南",
+            summary: "本轮回答依据",
+          }],
+        }]}
+        streamingMessageId={null}
+        isStreaming={false}
+      />,
+    );
+    expect(screen.getByText("冻结旅行三件套")).toBeInTheDocument();
+    expect(screen.queryByText("实时旅行三件套")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /回答来源/ })).toBeInTheDocument();
+  });
 });

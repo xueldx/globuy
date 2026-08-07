@@ -24,7 +24,7 @@ _TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
 def _web_source(item: dict, index: int) -> dict:
     title = str(item.get("title") or f"网页来源 {index + 1}")
-    url = str(item.get("url") or "")
+    url = str(item.get("url") or "")[:2048]
     stable_value = url or title
     source_key = sha256(stable_value.encode("utf-8")).hexdigest()[:12]
     source = {
