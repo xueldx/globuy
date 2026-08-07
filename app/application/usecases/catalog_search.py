@@ -56,6 +56,7 @@ class ProductCard:
     skus: list[dict]
     score: float
     landed_price: Optional[dict]  # ship_to 命中时的到手价明细，未命中为 None
+    citations: list[dict]
 
     def to_dict(self) -> dict:
         card = {
@@ -69,6 +70,7 @@ class ProductCard:
             "highlights": self.highlights,
             "skus": self.skus,
             "score": round(self.score, 4),
+            "citations": self.citations,
         }
         if self.landed_price is not None:
             card["landed_price"] = self.landed_price
@@ -234,6 +236,23 @@ class CatalogSearchUseCase:
     def _to_card(self, score: float, product: Product, spec: ProductSearchSpec) -> ProductCard:
         primary = product.primary_sku()
         landed_price: Optional[dict] = None
+        citations = [
+            {
+                "source_id": f"catalog:{product.product_id}",
+                "source_type": "catalog",
+                "label": f"商品目录 · {product.product_id}",
+                "summary": f"目录记录：{product.brand} {product.title}",
+                "fields": [
+                    "title",
+                    "brand",
+                    "category",
+                    "origin_country",
+                    "price_major",
+                    "highlights",
+                    "skus",
+                ],
+            },
+        ]
         if spec.ship_to:
             try:
                 quote = self._tariff.quote(
@@ -244,6 +263,18 @@ class CatalogSearchUseCase:
                     target_currency=spec.target_currency,
                 )
                 landed_price = quote.to_dict()
+                citations.append(
+                    {
+                        "source_id": (
+                            f"calculation:{product.category}:{spec.ship_to}:"
+                            f"{spec.target_currency}"
+                        ),
+                        "source_type": "calculation",
+                        "label": f"到手价计算 · {spec.ship_to}",
+                        "summary": "根据商品小计、运费与品类关税规则计算",
+                        "fields": ["landed_price"],
+                    },
+                )
             except ValueError as err:
                 # 目的国不在规则表内：如实标注，不编造数字
                 landed_price = {"unavailable_reason": str(err)}
@@ -268,4 +299,5 @@ class CatalogSearchUseCase:
             ],
             score=score,
             landed_price=landed_price,
+            citations=citations,
         )

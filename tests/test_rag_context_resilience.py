@@ -76,7 +76,7 @@ class TestCategoryKnowledge:
         assert again == 0
         assert len(await knowledge_base.list_documents()) == 2
 
-    async def test_insight_tool_returns_relevant_chunk(self, knowledge_base):
+    async def test_insight_tool_returns_relevant_chunk(self, knowledge_base, tmp_path):
         bus = TradeEventBus()
         queue = bus.subscribe("anonymous")
         tool = build_category_insight_tool(knowledge_base, bus)
@@ -87,6 +87,13 @@ class TestCategoryKnowledge:
         assert "免税额度" in payload["insights"][0]["content"]
         assert payload["insights"][0]["source"].endswith(".md")
         assert queue.qsize() == 2  # tool.invoke + tool.result
+        queue.get_nowait()
+        result_event = queue.get_nowait()
+        source = result_event.payload["sources"][0]
+        assert source["source_type"] == "knowledge"
+        assert source["label"].endswith(".md")
+        assert len(source["summary"]) <= 180
+        assert str(tmp_path) not in source["label"]
 
     async def test_insight_tool_degrades_when_kb_broken(self):
         class BrokenKnowledgeBase:

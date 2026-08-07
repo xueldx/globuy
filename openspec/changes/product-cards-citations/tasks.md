@@ -5,9 +5,9 @@
 
 ## 2. Backend source contracts
 
-- [ ] 2.1 Add catalog and landed-price citations to product search results
-- [ ] 2.2 Add bounded knowledge and web sources to tool result events
-- [ ] 2.3 Add backend tests for citation fields, source summaries, and missing optional data
+- [x] 2.1 Add catalog and landed-price citations to product search results
+- [x] 2.2 Add bounded knowledge and web sources to tool result events
+- [x] 2.3 Add backend tests for citation fields, source summaries, and missing optional data
 
 ## 3. Frontend projection and state
 

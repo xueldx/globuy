@@ -7,6 +7,7 @@
 注意：本模块不能用 `from __future__ import annotations`（AgentScope schema 生成依赖运行时注解）。
 """
 import json
+from hashlib import sha256
 
 from agentscope.message import TextBlock, ToolResultState
 from agentscope.rag import KnowledgeBase
@@ -26,6 +27,22 @@ def _chunk_text(content) -> str:
     if isinstance(content, dict):
         return content.get("text") or str(content)
     return str(content)
+
+
+def _source_label(source: str) -> str:
+    """来源可能是本地路径，只展示文件名，避免把服务目录暴露给浏览器。"""
+    return source.replace("\\", "/").rsplit("/", 1)[-1] or "品类知识库"
+
+
+def _knowledge_source(insight: dict) -> dict:
+    raw_source = str(insight["source"])
+    source_key = sha256(raw_source.encode("utf-8")).hexdigest()[:12]
+    return {
+        "source_id": f"knowledge:{source_key}",
+        "source_type": "knowledge",
+        "label": _source_label(raw_source),
+        "summary": str(insight["content"])[:180],
+    }
 
 
 def build_category_insight_tool(knowledge_base: KnowledgeBase, bus: TradeEventBus):
@@ -69,7 +86,11 @@ def build_category_insight_tool(knowledge_base: KnowledgeBase, bus: TradeEventBu
         bus.publish(
             session_id,
             "tool.result",
-            {"tool": "category_insight_tool", "hit_count": len(insights)},
+            {
+                "tool": "category_insight_tool",
+                "hit_count": len(insights),
+                "sources": [_knowledge_source(insight) for insight in insights],
+            },
         )
         return ToolChunk(
             content=[TextBlock(type="text", text=json.dumps({"insights": insights}, ensure_ascii=False))],

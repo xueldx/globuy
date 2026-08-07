@@ -60,6 +60,9 @@ class TestToolsDirectInvoke:
 
         payload = json.loads(response.content[0].text)
         assert payload["hits"][0]["product_id"] == "P1001"
+        catalog_source = payload["hits"][0]["citations"][0]
+        assert catalog_source["source_id"] == "catalog:P1001"
+        assert "price_major" in catalog_source["fields"]
         # tool.invoke + tool.result 两条事件
         assert queue.qsize() == 2
 

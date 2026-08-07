@@ -9,6 +9,7 @@ TAVILY_API_KEY 未配置时组装根不注册本工具（Agent 看不到它）�
 注意：本模块不能用 `from __future__ import annotations`（AgentScope schema 生成依赖运行时注解）。
 """
 import json
+from hashlib import sha256
 
 import httpx
 from agentscope.message import TextBlock, ToolResultState
@@ -19,6 +20,22 @@ from app.infrastructure.eventbus import TradeEventBus
 from app.infrastructure.settings import Settings
 
 _TAVILY_ENDPOINT = "https://api.tavily.com/search"
+
+
+def _web_source(item: dict, index: int) -> dict:
+    title = str(item.get("title") or f"网页来源 {index + 1}")
+    url = str(item.get("url") or "")
+    stable_value = url or title
+    source_key = sha256(stable_value.encode("utf-8")).hexdigest()[:12]
+    source = {
+        "source_id": f"web:{source_key}",
+        "source_type": "web",
+        "label": title[:160],
+        "summary": str(item.get("content") or "")[:180],
+    }
+    if url:
+        source["url"] = url
+    return source
 
 
 def build_web_search_tool(settings: Settings, bus: TradeEventBus):
@@ -58,7 +75,15 @@ def build_web_search_tool(settings: Settings, bus: TradeEventBus):
                 content=[TextBlock(type="text", text=f"[error] web 搜索失败：{err}")],
                 state=ToolResultState.ERROR,
             )
-        bus.publish(session_id, "tool.result", {"tool": "web_search_tool", "hit_count": len(results)})
+        bus.publish(
+            session_id,
+            "tool.result",
+            {
+                "tool": "web_search_tool",
+                "hit_count": len(results),
+                "sources": [_web_source(item, index) for index, item in enumerate(results)],
+            },
+        )
         return ToolChunk(
             content=[TextBlock(type="text", text=json.dumps({"results": results}, ensure_ascii=False))],
             state=ToolResultState.SUCCESS,

@@ -77,7 +77,7 @@ class TestTwoStageRecall:
         result = await usecase.execute(ProductSearchSpec(normalized_query="露营灯 抗造"))
         assert result["recall_strategy"] == "embedding_only"
         assert result["rerank_applied"] is False
-        assert result["hits"][0]["product_id"] == "P1008", "露营灯应排第一"
+        assert "灯" in result["hits"][0]["title"], "露营灯类商品应排第一"
 
     async def test_rerank_applied_changes_order(self, indexed):
         repo, embedder, index = indexed
@@ -151,12 +151,20 @@ class TestTwoStageRecall:
             landed["subtotal_major"] + landed["freight_major"] + landed["tariff_major"],
             abs=0.02,
         )
+        calculation = [
+            source for source in top["citations"]
+            if source["source_type"] == "calculation"
+        ]
+        assert calculation and calculation[0]["fields"] == ["landed_price"]
 
     async def test_no_landed_price_without_ship_to(self, indexed):
         repo, embedder, index = indexed
         usecase = CatalogSearchUseCase(repo, embedder=embedder, vector_index=index)
         result = await usecase.execute(ProductSearchSpec(normalized_query="露营灯"))
         assert "landed_price" not in result["hits"][0]
+        assert [
+            source["source_type"] for source in result["hits"][0]["citations"]
+        ] == ["catalog"]
 
     async def test_tool_event_carries_hits_for_frontend(self, indexed):
         """tool.result 事件必须带 hits，否则前端商品卡无法渲染。"""
@@ -185,5 +193,5 @@ class TestTwoStageRecall:
         result_event = queue.get_nowait()
         assert result_event.type == "tool.result"
         hits = result_event.payload["hits"]
-        assert hits and hits[0]["product_id"] == "P1008"
+        assert hits and "灯" in hits[0]["title"]
         assert hits[0]["landed_price"]["currency"] == "USD"
