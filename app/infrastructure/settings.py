@@ -106,8 +106,8 @@ def load_settings() -> Settings:
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
         llm_model=os.getenv("LLM_MODEL", "qwen3-max"),
-        # 与同工作区的 Globex 默认 8000 隔离，避免开发时 API 被错误服务接管。
-        port=int(os.getenv("PORT", "8010")),
+        # 与同工作区的 Globex 默认 8000 隔离，并避开部分 Windows 主机保留的 7998-8097 端口段。
+        port=int(os.getenv("PORT", "8310")),
         log_level=os.getenv("LOG_LEVEL", "info"),
         # embedding 默认复用 LLM 网关（OpenAI 兼容 /v1/embeddings）
         embedding_base_url=os.getenv("EMBEDDING_BASE_URL", llm_base_url),

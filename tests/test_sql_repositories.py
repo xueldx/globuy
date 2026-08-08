@@ -90,6 +90,16 @@ class TestEngineSelection:
         assert settings.database_url.startswith("sqlite+aiosqlite:///")
         assert settings.database_url.endswith("globex.db")
 
+    async def test_default_port_avoids_reserved_local_development_range(self, monkeypatch):
+        """默认端口不能落在本机 Windows 保留的 7998-8097 开发端口段。"""
+        from app.infrastructure.settings import load_settings
+
+        monkeypatch.setenv("LLM_API_KEY", "test-key")
+        monkeypatch.delenv("PORT", raising=False)
+
+        assert load_settings().port == 8310
+        assert not 7998 <= load_settings().port <= 8097
+
     async def test_explicit_database_url_wins(self, tmp_path, monkeypatch):
         from app.infrastructure.settings import load_settings
 
