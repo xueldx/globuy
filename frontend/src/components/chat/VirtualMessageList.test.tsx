@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage } from "@/types";
 import { useAgentProcessStore } from "@/stores/agentProcessStore";
+import { useChatStore } from "@/stores/chatStore";
 
 interface MockVirtuosoProps {
   data: ChatMessage[];
@@ -91,6 +92,7 @@ describe("VirtualMessageList", () => {
     virtuosoHarness.props = null;
     virtuosoHarness.scrollToIndex.mockReset();
     useAgentProcessStore.getState().reset();
+    useChatStore.setState({ streamingBySession: {} });
   });
 
   afterEach(() => {
@@ -393,11 +395,18 @@ describe("VirtualMessageList", () => {
       generation_id: "gen-f7",
       seq: 1,
     });
+    useChatStore.setState({ streamingBySession: { "session-a": "第 1 条消息" } });
     const streaming = { ...message(1, "assistant"), status: "streaming" as const };
     const { rerender } = render(
       <VirtualMessageList {...baseProps} messages={[streaming]} streamingMessageId={streaming.id} isStreaming />,
     );
-    expect(screen.getByText("实时旅行三件套")).toBeInTheDocument();
+    const liveProduct = screen.getByText("实时旅行三件套");
+    const liveAnswer = screen.getByText("第 1 条消息");
+    expect(liveProduct).toBeInTheDocument();
+    expect(
+      liveProduct.compareDocumentPosition(liveAnswer) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(currentProps().followOutput?.(false)).toBe("auto");
 
     rerender(
       <VirtualMessageList
@@ -417,7 +426,12 @@ describe("VirtualMessageList", () => {
         isStreaming={false}
       />,
     );
-    expect(screen.getByText("冻结旅行三件套")).toBeInTheDocument();
+    const frozenProduct = screen.getByText("冻结旅行三件套");
+    const frozenAnswer = screen.getByText("第 1 条消息");
+    expect(frozenProduct).toBeInTheDocument();
+    expect(
+      frozenProduct.compareDocumentPosition(frozenAnswer) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(screen.queryByText("实时旅行三件套")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /回答来源/ })).toBeInTheDocument();
   });

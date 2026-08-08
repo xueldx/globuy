@@ -354,12 +354,12 @@ function MessageRow({ message }: { message: ChatMessage }) {
             status={message.status === "done" ? "completed" : message.status === "cancelled" ? "cancelled" : "failed"}
           />
         )}
+        {!isUser && <CommerceArtifacts products={message.products} sources={message.sources} />}
         {isUser ? (
           <p className="whitespace-pre-wrap break-words">{message.content}</p>
         ) : (
           <SafeStreamingMarkdown content={message.content} messageId={message.id} />
         )}
-        {!isUser && <CommerceArtifacts products={message.products} sources={message.sources} />}
         {!isUser && message.status === "cancelled" && (
           <p className="mt-1 text-xs text-muted">（已停止）</p>
         )}
@@ -383,12 +383,12 @@ function StreamingBubble({ sessionId }: { sessionId: string }) {
       <div className="min-w-0 max-w-[88%] rounded-lg border bg-surface px-3 py-2 text-sm">
         <p className="mb-1 text-xs text-muted">Agent</p>
         <LiveEventTimeline sessionId={sessionId} />
+        <LiveCommerceArtifacts sessionId={sessionId} />
         <SafeStreamingMarkdown
           content={streamingContent}
           isStreaming
           messageId={`streaming-${sessionId}`}
         />
-        <LiveCommerceArtifacts sessionId={sessionId} />
       </div>
     </div>
   );
